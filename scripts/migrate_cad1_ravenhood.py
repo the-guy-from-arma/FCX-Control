@@ -717,12 +717,13 @@ def migrate_users(
 def remap_value(table: str, column: str, value: Any, players: dict[int, int], admins: dict[int, int]) -> Any:
     if value is None:
         return None
-    source_id = int(value)
     if column in PLAYER_USER_COLUMNS.get(table, ()):
+        source_id = int(value)
         if source_id not in players:
             raise RuntimeError(f"No Ravenhood identity mapping for {table}.{column}={source_id}")
         return players[source_id]
     if column in ADMIN_USER_COLUMNS.get(table, ()):
+        source_id = int(value)
         if source_id not in admins:
             raise RuntimeError(f"No FCX actor mapping for {table}.{column}={source_id}")
         return admins[source_id]
@@ -1195,4 +1196,3 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"Migration failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         raise
-
