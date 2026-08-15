@@ -1068,8 +1068,22 @@ def main() -> int:
             "operational_relationships": operational_relationships,
             "preflight": preflight,
         }
+        compact_plan = {
+            "run_id": run_id,
+            "phase": args.phase,
+            "community_id": COMMUNITY_ID,
+            "source_fingerprint": fingerprint,
+            "table_count": len(tables),
+            "row_count": sum(expected_counts.values()),
+            "source_read_only": True,
+            "identity_expectations": plan["identity_expectations"],
+            "same_database": bool(preflight["same_database"]),
+            "missing_required_target_tables": preflight["missing_required_target_tables"],
+            "target_nonempty_operational_tables": preflight["target_nonempty_operational_tables"],
+            "tables": expected_counts,
+        }
         if args.phase == "plan":
-            print(json.dumps(plan, indent=2, default=str) if args.json else json.dumps(plan, default=str))
+            print(json.dumps(plan, indent=2, default=str) if args.json else json.dumps(compact_plan, default=str))
             return 0
 
         if preflight["same_database"]:
@@ -1158,7 +1172,12 @@ def main() -> int:
                 target.commit()
 
             result = {**plan, "status": "cutover_ready" if args.phase in {"finalize", "all"} else "copied", "reconciliation": report}
-            print(json.dumps(result, indent=2, default=str) if args.json else json.dumps(result, default=str))
+            compact_result = {
+                **compact_plan,
+                "status": result["status"],
+                "reconciliation": report,
+            }
+            print(json.dumps(result, indent=2, default=str) if args.json else json.dumps(compact_result, default=str))
             return 0
         except Exception as exc:
             target.rollback()
@@ -1176,3 +1195,4 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"Migration failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         raise
+
