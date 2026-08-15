@@ -29,7 +29,7 @@ from .security import (
 
 
 router = APIRouter(prefix="/api/v1")
-ADMIN_ROLES = ("commissioner", "fec_admin", "fcx_admin")
+ADMIN_ROLES = ("developer", "commissioner", "fec_admin", "fcx_admin")
 
 
 def utcnow() -> datetime:
@@ -365,7 +365,7 @@ def accounts(limit: int = 200, _: dict[str, Any] = Depends(require_roles(*ADMIN_
 
 
 @router.get("/admin/investigations")
-def investigations(limit: int = 200, _: dict[str, Any] = Depends(require_roles("fec_admin", "commissioner"))) -> dict[str, Any]:
+def investigations(limit: int = 200, _: dict[str, Any] = Depends(require_roles("developer"))) -> dict[str, Any]:
     safe_limit = min(max(limit, 1), 1000)
     with transaction() as connection:
         rows = all_rows(
@@ -383,7 +383,7 @@ def investigations(limit: int = 200, _: dict[str, Any] = Depends(require_roles("
 
 
 @router.patch("/admin/investigations/{case_id}")
-def update_investigation(case_id: int, payload: InvestigationPatch, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("fec_admin", "commissioner"))) -> dict[str, Any]:
+def update_investigation(case_id: int, payload: InvestigationPatch, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
     changes = payload.model_dump(exclude_none=True)
     if not changes:
         raise HTTPException(status_code=400, detail="No investigation changes supplied")
@@ -419,7 +419,7 @@ def market_admin(_: dict[str, Any] = Depends(require_roles(*ADMIN_ROLES))) -> di
 
 
 @router.patch("/admin/market/settings")
-def update_market_settings(payload: MarketSettingsPatch, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("fcx_admin", "commissioner"))) -> dict[str, Any]:
+def update_market_settings(payload: MarketSettingsPatch, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
     changes = payload.model_dump(exclude_none=True)
     if not changes:
         raise HTTPException(status_code=400, detail="No market settings supplied")
@@ -443,7 +443,7 @@ def credentials(_: dict[str, Any] = Depends(require_roles("fcx_admin", "commissi
 
 
 @router.post("/admin/investigations")
-def open_investigation(payload: InvestigationRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("fec_admin", "commissioner"))) -> dict[str, Any]:
+def open_investigation(payload: InvestigationRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
     case_id = "FEC-" + utcnow().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
     with transaction() as connection:
         execute(

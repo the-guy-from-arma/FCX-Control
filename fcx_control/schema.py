@@ -193,17 +193,23 @@ def _requires_exchange_schema(statement: str) -> bool:
 
 def _ensure_bootstrap_admin(connection, now: datetime) -> None:
     admin = one(connection, "SELECT id FROM fcx_control_admin_users LIMIT 1")
-    if admin is None and settings.bootstrap_email and settings.bootstrap_password:
+    if settings.bootstrap_email and settings.bootstrap_password and (admin is None or settings.bootstrap_force_sync):
         execute(
             connection,
             """INSERT INTO fcx_control_admin_users
                 (email,display_name,password_hash,roles_json,active,created_at,updated_at)
-                VALUES (:email,:name,:password,CAST(:roles AS jsonb),TRUE,:now,:now)""",
+                VALUES (:email,:name,:password,CAST(:roles AS jsonb),TRUE,:now,:now)
+                ON CONFLICT(email) DO UPDATE SET
+                    display_name=excluded.display_name,
+                    password_hash=excluded.password_hash,
+                    roles_json=excluded.roles_json,
+                    active=TRUE,
+                    updated_at=excluded.updated_at""",
             {
                 "email": settings.bootstrap_email,
                 "name": "FCX Bootstrap Administrator",
                 "password": hash_password(settings.bootstrap_password),
-                "roles": '["super_admin","commissioner","fec_admin","fcx_admin"]',
+                "roles": '["super_admin","developer","commissioner","fec_admin","fcx_admin"]',
                 "now": now,
             },
         )

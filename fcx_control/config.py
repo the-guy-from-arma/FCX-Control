@@ -24,6 +24,7 @@ class Settings:
     public_origin: str
     bootstrap_email: str
     bootstrap_password: str
+    bootstrap_force_sync: bool
     api_rate_limit_per_minute: int
 
     @classmethod
@@ -38,11 +39,11 @@ class Settings:
             session_secret=required("FCX_SESSION_SECRET"),
             cookie_secure=flag("FCX_COOKIE_SECURE", True),
             public_origin=str(os.environ.get("FCX_PUBLIC_ORIGIN") or "").rstrip("/"),
-            bootstrap_email=str(os.environ.get("FCX_BOOTSTRAP_ADMIN_EMAIL") or "").strip().lower(),
-            bootstrap_password=str(os.environ.get("FCX_BOOTSTRAP_ADMIN_PASSWORD") or ""),
+            bootstrap_email=str(os.environ.get("FCX_BOOTSTRAP_ADMIN_EMAIL") or os.environ.get("OWNER_EMAIL") or "").strip().lower(),
+            bootstrap_password=str(os.environ.get("FCX_BOOTSTRAP_ADMIN_PASSWORD") or os.environ.get("OWNER_PASSWORD") or ""),
+            bootstrap_force_sync=flag("FCX_BOOTSTRAP_FORCE_SYNC", False),
             api_rate_limit_per_minute=max(10, int(os.environ.get("FCX_API_RATE_LIMIT_PER_MINUTE", "120"))),
         )
 
 
 settings = Settings.load()
-

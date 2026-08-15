@@ -9,6 +9,16 @@ const sections = [
   ["audit", "Audit Log"], ["health", "System Health"],
 ];
 
+function currentRoles() { return new Set((state.user?.roles || []).map(role => String(role).toLowerCase())); }
+function isDeveloper() { const roles = currentRoles(); return roles.has("super_admin") || roles.has("developer"); }
+function visibleSections() {
+  if (isDeveloper()) return sections;
+  const roles = currentRoles();
+  if (roles.has("fec_admin")) return sections.filter(([key]) => ["overview", "accounts", "audit", "health"].includes(key));
+  if (roles.has("fcx_admin") || roles.has("commissioner")) return sections.filter(([key]) => !["investigations", "leverage", "settings"].includes(key));
+  return sections.filter(([key]) => ["overview", "health"].includes(key));
+}
+
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
 const money = value => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(Number(value || 0));
@@ -38,7 +48,9 @@ async function request(path, options = {}) {
 }
 
 function renderNav() {
-  $("#nav").innerHTML = sections.map(([key, label]) => `<button class="nav-button ${key === state.section ? "active" : ""}" data-section="${key}">${label}</button>`).join("");
+  const available = visibleSections();
+  if (!available.some(([key]) => key === state.section)) state.section = available[0]?.[0] || "health";
+  $("#nav").innerHTML = available.map(([key, label]) => `<button class="nav-button ${key === state.section ? "active" : ""}" data-section="${key}">${label}</button>`).join("");
   $("#nav").querySelectorAll("button").forEach(button => button.addEventListener("click", () => openSection(button.dataset.section)));
 }
 
