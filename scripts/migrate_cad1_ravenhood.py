@@ -89,6 +89,10 @@ PLAYER_USER_COLUMNS: dict[str, tuple[str, ...]] = {
     "business_issuer_ledger": ("user_id",),
     "business_issuer_announcements": ("created_by",),
     "business_issuer_assignments": ("user_id",),
+    # Engine surveillance flags identify the resident Ravenhood account under
+    # review, not an FCX administrator.  Remap the legacy CAD user id to the
+    # standalone account identity just like market_accounts.user_id.
+    "fcx_engine_risk_flags": ("user_id",),
 }
 
 ADMIN_USER_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -108,6 +112,11 @@ ADMIN_USER_COLUMNS: dict[str, tuple[str, ...]] = {
     "business_issuer_companies": ("created_by", "assigned_by", "reviewed_by"),
     "business_issuer_ipo_reviews": ("reviewed_by",),
     "business_issuer_assignments": ("actor_id",),
+    # These are historical control-plane actors.  Preserve their audit trail
+    # as disabled imported FCX actors; never grant a migrated CAD credential
+    # access to the standalone control service.
+    "fcx_engine_corporate_actions": ("created_by",),
+    "fcx_engine_deployments": ("deployed_by",),
 }
 
 MONEY_CHECKS: dict[str, tuple[str, ...]] = {
