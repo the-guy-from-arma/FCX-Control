@@ -184,23 +184,44 @@ DDL = (
 )
 
 
+def _requires_exchange_schema(statement: str) -> bool:
+    normalized = " ".join(statement.split()).lower()
+    return normalized.startswith("create table if not exists fcx_trade_requests") or normalized.startswith(
+        "create index if not exists fcx_trade_requests_"
+    )
+
+
+def _ensure_bootstrap_admin(connection, now: datetime) -> None:
+    admin = one(connection, "SELECT id FROM fcx_control_admin_users LIMIT 1")
+    if admin is None and settings.bootstrap_email and settings.bootstrap_password:
+        execute(
+            connection,
+            """INSERT INTO fcx_control_admin_users
+                (email,display_name,password_hash,roles_json,active,created_at,updated_at)
+                VALUES (:email,:name,:password,CAST(:roles AS jsonb),TRUE,:now,:now)""",
+            {
+                "email": settings.bootstrap_email,
+                "name": "FCX Bootstrap Administrator",
+                "password": hash_password(settings.bootstrap_password),
+                "roles": '["super_admin","commissioner","fec_admin","fcx_admin"]',
+                "now": now,
+            },
+        )
+
+
+def ensure_identity_schema() -> None:
+    """Create FCX control identities before exchange tables reference them."""
+    now = datetime.now(timezone.utc)
+    with transaction() as connection:
+        for statement in DDL:
+            if not _requires_exchange_schema(statement):
+                execute(connection, statement)
+        _ensure_bootstrap_admin(connection, now)
+
+
 def ensure_schema() -> None:
     now = datetime.now(timezone.utc)
     with transaction() as connection:
         for statement in DDL:
             execute(connection, statement)
-        admin = one(connection, "SELECT id FROM fcx_control_admin_users LIMIT 1")
-        if admin is None and settings.bootstrap_email and settings.bootstrap_password:
-            execute(
-                connection,
-                """INSERT INTO fcx_control_admin_users
-                    (email,display_name,password_hash,roles_json,active,created_at,updated_at)
-                    VALUES (:email,:name,:password,CAST(:roles AS jsonb),TRUE,:now,:now)""",
-                {
-                    "email": settings.bootstrap_email,
-                    "name": "FCX Bootstrap Administrator",
-                    "password": hash_password(settings.bootstrap_password),
-                    "roles": '["super_admin","commissioner","fec_admin","fcx_admin"]',
-                    "now": now,
-                },
-            )
+        _ensure_bootstrap_admin(connection, now)

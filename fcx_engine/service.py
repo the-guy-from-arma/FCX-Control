@@ -32,7 +32,7 @@ from .engine import (
 )
 from .sandbox import run_sandbox
 from fcx_control.base_schema import ensure_base_schema
-from fcx_control.schema import ensure_schema as ensure_control_schema
+from fcx_control.schema import ensure_identity_schema, ensure_schema as ensure_control_schema
 
 
 def _database_url() -> str:
@@ -149,9 +149,11 @@ def startup() -> None:
     # Control identities and communities must exist before the exchange-owned
     # compatibility schema, whose foreign keys deliberately never reference a
     # CAD database.  Engine tables are created last.
-    ensure_control_schema()
+    ensure_identity_schema()
     with transaction() as db:
         ensure_base_schema(db)
+    ensure_control_schema()
+    with transaction() as db:
         ensure_schema(db)
     run_scheduler = str(os.environ.get("FCX_RUN_SCHEDULER", "1")).strip().lower() in {"1", "true", "yes", "on"}
     if run_scheduler and not scheduler.running:
