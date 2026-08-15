@@ -25,6 +25,9 @@ class Settings:
     bootstrap_email: str
     bootstrap_password: str
     bootstrap_force_sync: bool
+    bootstrap_community_id: str
+    bootstrap_community_name: str
+    bootstrap_community_api_key: str
     api_rate_limit_per_minute: int
 
     @classmethod
@@ -42,6 +45,9 @@ class Settings:
             bootstrap_email=str(os.environ.get("FCX_BOOTSTRAP_ADMIN_EMAIL") or os.environ.get("OWNER_EMAIL") or "").strip().lower(),
             bootstrap_password=str(os.environ.get("FCX_BOOTSTRAP_ADMIN_PASSWORD") or os.environ.get("OWNER_PASSWORD") or ""),
             bootstrap_force_sync=flag("FCX_BOOTSTRAP_FORCE_SYNC", False),
+            bootstrap_community_id=str(os.environ.get("FCX_BOOTSTRAP_COMMUNITY_ID") or "").strip().lower(),
+            bootstrap_community_name=str(os.environ.get("FCX_BOOTSTRAP_COMMUNITY_NAME") or "").strip(),
+            bootstrap_community_api_key=str(os.environ.get("FCX_BOOTSTRAP_COMMUNITY_API_KEY") or "").strip(),
             api_rate_limit_per_minute=max(10, int(os.environ.get("FCX_API_RATE_LIMIT_PER_MINUTE", "120"))),
         )
 

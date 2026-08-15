@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from .config import settings
 from .db import execute, one, transaction
-from .security import hash_password
+from .security import hash_password, protected_hash
 
 
 DDL = (
@@ -215,6 +215,57 @@ def _ensure_bootstrap_admin(connection, now: datetime) -> None:
         )
 
 
+def _ensure_bootstrap_community_credential(connection, now: datetime) -> None:
+    community_id = settings.bootstrap_community_id
+    presented = settings.bootstrap_community_api_key
+    if not community_id and not presented:
+        return
+    if not community_id or not presented:
+        raise RuntimeError(
+            "FCX_BOOTSTRAP_COMMUNITY_ID and FCX_BOOTSTRAP_COMMUNITY_API_KEY must be configured together"
+        )
+    if "." not in presented:
+        raise RuntimeError("FCX_BOOTSTRAP_COMMUNITY_API_KEY must use the credential_id.secret format")
+    credential_id, secret = presented.split(".", 1)
+    if not credential_id.startswith("fcx_") or not secret:
+        raise RuntimeError("FCX_BOOTSTRAP_COMMUNITY_API_KEY is malformed")
+
+    execute(
+        connection,
+        """INSERT INTO fcx_communities
+            (community_id,community_name,status,connection_enabled,trading_enabled,
+             buy_enabled,sell_enabled,account_creation_enabled,suspended,
+             created_at,updated_at)
+            VALUES (:community_id,:community_name,'active',TRUE,TRUE,TRUE,TRUE,TRUE,FALSE,:now,:now)
+            ON CONFLICT(community_id) DO NOTHING""",
+        {
+            "community_id": community_id,
+            "community_name": settings.bootstrap_community_name or community_id,
+            "now": now,
+        },
+    )
+    execute(
+        connection,
+        """INSERT INTO fcx_community_credentials
+            (community_id,credential_id,secret_hash,scopes_json,active,revoked_at,created_at)
+            VALUES (:community_id,:credential_id,:secret_hash,
+                    '[\"account:link\",\"market:read\",\"settlement:write\",\"trade:write\"]'::jsonb,
+                    TRUE,NULL,:now)
+            ON CONFLICT(credential_id) DO UPDATE SET
+                community_id=excluded.community_id,
+                secret_hash=excluded.secret_hash,
+                scopes_json=excluded.scopes_json,
+                active=TRUE,
+                revoked_at=NULL""",
+        {
+            "community_id": community_id,
+            "credential_id": credential_id,
+            "secret_hash": protected_hash(secret),
+            "now": now,
+        },
+    )
+
+
 def ensure_identity_schema() -> None:
     """Create FCX control identities before exchange tables reference them."""
     now = datetime.now(timezone.utc)
@@ -223,6 +274,7 @@ def ensure_identity_schema() -> None:
             if not _requires_exchange_schema(statement):
                 execute(connection, statement)
         _ensure_bootstrap_admin(connection, now)
+        _ensure_bootstrap_community_credential(connection, now)
 
 
 def ensure_schema() -> None:
@@ -231,3 +283,4 @@ def ensure_schema() -> None:
         for statement in DDL:
             execute(connection, statement)
         _ensure_bootstrap_admin(connection, now)
+        _ensure_bootstrap_community_credential(connection, now)
