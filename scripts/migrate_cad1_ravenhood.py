@@ -339,6 +339,45 @@ def source_foreign_keys(
         return [dict(row) for row in cursor.fetchall()]
 
 
+def dependency_ordered_tables(
+    tables: Sequence[str], foreign_keys: Sequence[dict[str, Any]]
+) -> list[str]:
+    """Return a stable parent-before-child order for operational promotion.
+
+    ``TABLE_PRIORITY`` remains the human-readable preference for unrelated
+    tables, while the live CAD schema foreign keys are authoritative.  This
+    keeps the migration safe when FCX gains a new dependent history table and
+    prevents audit rows from being inserted before their referenced cycles,
+    investors, securities, or deployments.
+    """
+    table_set = set(tables)
+    dependencies: dict[str, set[str]] = {table: set() for table in tables}
+    for foreign_key in foreign_keys:
+        child = str(foreign_key["child_table"])
+        parent = str(foreign_key["parent_table"])
+        if child in table_set and parent in table_set and child != parent:
+            dependencies[child].add(parent)
+
+    ordered: list[str] = []
+    remaining = set(tables)
+    while remaining:
+        ready = [
+            table
+            for table in remaining
+            if not (dependencies.get(table, set()) & remaining)
+        ]
+        if not ready:
+            cycle = ", ".join(sorted(remaining))
+            raise RuntimeError(
+                "Migration refused: cyclic FCX table dependencies require explicit review: "
+                + cycle
+            )
+        ready.sort(key=lambda item: (TABLE_PRIORITY.get(item, 1_000), item))
+        ordered.extend(ready)
+        remaining.difference_update(ready)
+    return ordered
+
+
 def validate_user_reference_registry(
     source: psycopg.Connection[Any], tables: Sequence[str]
 ) -> list[dict[str, str]]:
@@ -1029,7 +1068,8 @@ def main() -> int:
         tables = fetch_tables(source)
         if not tables:
             raise RuntimeError("No Ravenhood/FCX source tables were discovered in CAD 1")
-        tables.sort(key=lambda item: (TABLE_PRIORITY.get(item, 1_000), item))
+        source_relationships = source_foreign_keys(source, tables)
+        tables = dependency_ordered_tables(tables, source_relationships)
         user_reference_registry = validate_user_reference_registry(source, tables)
         expected_resident_ids, expected_audit_actor_ids = relevant_source_users(
             source, set(tables)
@@ -1042,7 +1082,7 @@ def main() -> int:
                 "parent_table": str(item["parent_table"]),
                 "parent_columns": list(item["parent_columns"]),
             }
-            for item in source_foreign_keys(source, tables)
+            for item in source_relationships
             if str(item["parent_table"]) in set(tables)
         ]
         preflight = target_preflight(source, target, tables)
