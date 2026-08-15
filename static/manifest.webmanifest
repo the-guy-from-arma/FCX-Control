@@ -1,0 +1,14 @@
+{
+  "name": "FCX / Ravenhood Control",
+  "short_name": "FCX Control",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#020b0f",
+  "theme_color": "#020b0f",
+  "description": "Standalone Ravenhood exchange and FEC operations platform",
+  "icons": [
+    {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"},
+    {"src": "/icon-maskable.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable"}
+  ]
+}

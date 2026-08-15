@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#060b10">
+  <title>FCX Control</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/control.css">
+</head>
+<body>
+  <div class="aurora" aria-hidden="true"></div>
+  <section id="login" class="login-shell">
+    <form id="login-form" class="login-card">
+      <div class="brand-mark">FCX</div>
+      <p class="eyebrow">RAVENHOOD / FEC CONTROL NETWORK</p>
+      <h1>The exchange has its own front door.</h1>
+      <p class="muted">Authorized commissioners, FEC investigators, and FCX operators only.</p>
+      <label>Email<input id="email" type="email" autocomplete="username" required></label>
+      <label>Password<input id="password" type="password" autocomplete="current-password" minlength="8" required></label>
+      <button type="submit">Enter control platform</button>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+  </section>
+
+  <div id="workspace" class="workspace" hidden>
+    <aside class="rail">
+      <div><div class="brand-mark small">FCX</div><p class="eyebrow">CONTROL PLATFORM</p></div>
+      <nav id="nav"></nav>
+      <div class="rail-foot"><span class="signal"></span><span>Independent service</span><button id="logout">Log out</button></div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div><p class="eyebrow" id="section-kicker">EXCHANGE INTELLIGENCE</p><h2 id="section-title">Overview</h2></div>
+        <div class="operator"><span id="operator-name"></span><button id="refresh">Synchronize</button></div>
+      </header>
+      <div id="notice" class="notice" hidden></div>
+      <section id="content" class="content"></section>
+    </main>
+  </div>
+  <script src="/control.js" defer></script>
+</body>
+</html>
+
