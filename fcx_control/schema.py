@@ -250,24 +250,6 @@ def _ensure_community_credential(
         },
     )
 
-
-def _ensure_bootstrap_community_credentials(connection, now: datetime) -> None:
-    _ensure_community_credential(
-        connection,
-        now,
-        settings.bootstrap_community_id,
-        settings.bootstrap_community_name,
-        settings.bootstrap_community_api_key,
-        "FCX_BOOTSTRAP",
-    )
-    _ensure_community_credential(
-        connection,
-        now,
-        settings.bootstrap_cad2_community_id,
-        settings.bootstrap_cad2_community_name,
-        settings.bootstrap_cad2_community_api_key,
-        "FCX_BOOTSTRAP_CAD2",
-    )
     execute(
         connection,
         """INSERT INTO fcx_community_credentials
@@ -287,6 +269,25 @@ def _ensure_bootstrap_community_credentials(connection, now: datetime) -> None:
             "secret_hash": protected_hash(secret),
             "now": now,
         },
+    )
+
+
+def _ensure_bootstrap_community_credentials(connection, now: datetime) -> None:
+    _ensure_community_credential(
+        connection,
+        now,
+        settings.bootstrap_community_id,
+        settings.bootstrap_community_name,
+        settings.bootstrap_community_api_key,
+        "FCX_BOOTSTRAP",
+    )
+    _ensure_community_credential(
+        connection,
+        now,
+        settings.bootstrap_cad2_community_id,
+        settings.bootstrap_cad2_community_name,
+        settings.bootstrap_cad2_community_api_key,
+        "FCX_BOOTSTRAP_CAD2",
     )
 
 
