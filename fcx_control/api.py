@@ -1823,12 +1823,71 @@ def community_market(principal: dict[str, Any] = Depends(require_community_scope
                ORDER BY s.ticker""",
         )
         settings_rows = all_rows(connection, "SELECT setting_key,setting_value FROM system_settings WHERE setting_key IN ('market_open','buy_enabled','sell_enabled','maintenance_mode')")
+        trade_tape = all_rows(
+            connection,
+            """SELECT t.id,s.ticker,s.name AS security_name,t.buy_volume,t.sell_volume,
+                      t.buy_trade_count,t.sell_trade_count,t.reference_price,
+                      t.price_change_percent,t.source,t.created_at
+               FROM market_system_trades t
+               JOIN market_securities s ON s.id=t.security_id
+               WHERE s.active=1 AND s.lifecycle_status='active'
+               ORDER BY t.id DESC LIMIT 80""",
+        )
+        history_rows = all_rows(
+            connection,
+            """SELECT ticker,price,source,recorded_at FROM (
+                   SELECT s.ticker,h.price,h.source,h.recorded_at,
+                          ROW_NUMBER() OVER (PARTITION BY h.security_id ORDER BY h.id DESC) AS position
+                   FROM market_price_history h
+                   JOIN market_securities s ON s.id=h.security_id
+                   WHERE s.active=1 AND s.lifecycle_status='active'
+               ) history WHERE position<=240 ORDER BY ticker,recorded_at""",
+        )
+        index_funds = all_rows(
+            connection,
+            """SELECT f.id,f.fund_key,f.display_name,f.risk_profile,f.target_size,
+                      f.base_nav,f.management_fee_percent,f.last_rebalanced_at,
+                      f.last_valued_at,s.ticker,s.price,s.previous_price,
+                      (SELECT COUNT(*) FROM market_index_members m WHERE m.fund_id=f.id) AS constituent_count
+               FROM market_index_funds f
+               JOIN market_securities s ON s.id=f.security_id
+               WHERE f.enabled=1 ORDER BY f.fund_key""",
+        )
+        member_rows = all_rows(
+            connection,
+            """SELECT m.fund_id,s.ticker,s.name,m.weight,m.rank,m.reference_price,
+                      m.market_cap_at_rebalance,m.realized_volatility
+               FROM market_index_members m
+               JOIN market_securities s ON s.id=m.security_id
+               ORDER BY m.fund_id,m.rank,s.ticker""",
+        )
+    price_history: dict[str, list[dict[str, Any]]] = {}
+    for row in history_rows:
+        ticker = str(row.pop("ticker"))
+        price_history.setdefault(ticker, []).append(row)
+    members_by_fund: dict[int, list[dict[str, Any]]] = {}
+    for row in member_rows:
+        fund_id = int(row.pop("fund_id"))
+        members_by_fund.setdefault(fund_id, []).append(row)
+    for fund in index_funds:
+        fund["members"] = members_by_fund.get(int(fund["id"]), [])
+    buy_volume = sum((Decimal(str(row.get("buy_volume") or 0)) for row in trade_tape), Decimal("0"))
+    sell_volume = sum((Decimal(str(row.get("sell_volume") or 0)) for row in trade_tape), Decimal("0"))
     return {
         "ok": True,
         "community_id": principal["community_id"],
         "permissions": {"trading": principal["trading_enabled"], "buy": principal["buy_enabled"], "sell": principal["sell_enabled"]},
         "market": {row["setting_key"]: row["setting_value"] for row in settings_rows},
         "securities": securities,
+        "anonymous_trade_tape": trade_tape,
+        "price_history": price_history,
+        "index_funds": index_funds,
+        "company_wire": [],
+        "market_analytics": {
+            "recorded_buy_volume": buy_volume,
+            "recorded_sell_volume": sell_volume,
+            "recorded_trade_events": len(trade_tape),
+        },
     }
 
 
