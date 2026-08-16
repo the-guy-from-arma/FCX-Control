@@ -115,6 +115,11 @@ DDL = (
     )""",
     """CREATE INDEX IF NOT EXISTS fcx_settlements_state_idx
         ON fcx_settlements(community_id,state,created_at)""",
+    """ALTER TABLE fcx_settlements ADD COLUMN IF NOT EXISTS wallet_reserved_at TIMESTAMPTZ""",
+    """ALTER TABLE fcx_settlements ADD COLUMN IF NOT EXISTS wallet_applied_at TIMESTAMPTZ""",
+    """ALTER TABLE fcx_settlements ADD COLUMN IF NOT EXISTS wallet_reversed_at TIMESTAMPTZ""",
+    """ALTER TABLE fcx_settlements ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ""",
+    """ALTER TABLE fcx_settlements ADD COLUMN IF NOT EXISTS cancel_reason TEXT NOT NULL DEFAULT ''""",
     """CREATE TABLE IF NOT EXISTS fcx_trade_requests (
         id BIGSERIAL PRIMARY KEY,
         trade_request_id TEXT NOT NULL UNIQUE,

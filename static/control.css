@@ -197,3 +197,26 @@ td code { display: block; max-width: 360px; overflow-wrap: anywhere; color: #a8c
   .login-card { padding: 30px 22px; }
 }
 .dense-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0;border-top:1px solid var(--line);margin:1rem 0}.dense-stats div{padding:.75rem 0;border-bottom:1px solid var(--line)}.dense-stats dt{color:var(--muted);font-size:.68rem;letter-spacing:.09em;text-transform:uppercase}.dense-stats dd{margin:.25rem 0 0;font-weight:800}.rank-row{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.65rem 0;border-bottom:1px solid var(--line)}.rank-row>span{min-width:0}.inline-actions{display:flex;flex-wrap:wrap;gap:.35rem}.inline-actions button{padding:.45rem .65rem;font-size:.72rem}
+
+.settlement-filter-grid { display: grid; grid-template-columns: repeat(6, minmax(112px, 1fr)); gap: 8px; margin: 0 0 14px; }
+.settlement-filter { min-width: 0; display: flex; justify-content: space-between; align-items: center; gap: 10px; border-radius: 9px; padding: 12px 14px; text-align: left; }
+.settlement-filter small { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .1em; }
+.settlement-filter strong { font-size: 20px; font-variant-numeric: tabular-nums; }
+.settlement-filter.active { color: var(--ink); border-color: rgba(96,234,213,.58); background: linear-gradient(110deg, rgba(96,234,213,.16), rgba(97,169,255,.08)); box-shadow: inset 2px 0 var(--cyan); }
+.settlement-toolbar { display: flex; align-items: center; gap: 9px; padding: 14px 16px; border: 1px solid var(--line); background: rgba(8,20,26,.68); }
+.settlement-toolbar > div { min-width: 0; margin-right: auto; }
+.settlement-toolbar strong, .settlement-toolbar small { display: block; }
+.settlement-toolbar small { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.settlement-ledger { margin-top: 14px; border: 1px solid var(--line); }
+.settlement-ledger tr[hidden] { display: none; }
+.settlement-direction, .settlement-state { display: inline-flex; padding: 5px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--cyan); font-size: 9px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; white-space: nowrap; }
+.settlement-direction.withdrawal { color: var(--amber); }
+.settlement-state.claimed { color: var(--blue); }
+.settlement-state.completed { color: var(--green); }
+.settlement-state.failed { color: var(--red); }
+.settlement-state.cancelled { color: #97a8a7; }
+.settlement-actions { display: flex; flex-wrap: wrap; gap: 5px; min-width: 172px; }
+.settlement-actions button { padding: 6px 9px; border-radius: 7px; font-size: 9px; }
+.failure-detail { color: var(--red); }
+@media (max-width: 1120px) { .settlement-filter-grid { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 760px) { .settlement-filter-grid { grid-template-columns: repeat(2, 1fr); } .settlement-toolbar { align-items: stretch; flex-direction: column; } .settlement-toolbar button { width: 100%; } }

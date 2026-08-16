@@ -1,9 +1,9 @@
 const API = "/api/v1";
-const state = { user: null, csrf: "", section: "overview", cache: new Map() };
+const state = { user: null, csrf: "", section: "overview", cache: new Map(), settlementFilter: "all" };
 const sections = [
   ["overview", "Overview"], ["engine", "FCX Engine"], ["operations", "Market Operations"], ["market", "Market"], ["companies", "Companies"],
   ["securities", "Securities"], ["orders", "Orders"], ["trades", "Trades"],
-  ["accounts", "Ravenhood Accounts"], ["investigations", "FEC Investigations"],
+  ["accounts", "Ravenhood Accounts"], ["banking", "FCX Banking"], ["investigations", "FEC Investigations"],
   ["communities", "Communities"], ["connections", "API Connections"],
   ["leverage", "Leverage"], ["settings", "Market Settings"],
   ["audit", "Audit Log"], ["health", "System Health"],
@@ -14,7 +14,7 @@ function isDeveloper() { const roles = currentRoles(); return roles.has("super_a
 function visibleSections() {
   if (isDeveloper()) return sections;
   const roles = currentRoles();
-  if (roles.has("fec_admin")) return sections.filter(([key]) => ["overview", "operations", "market", "securities", "orders", "trades", "accounts", "investigations", "leverage", "audit", "health"].includes(key));
+  if (roles.has("fec_admin")) return sections.filter(([key]) => ["overview", "operations", "market", "securities", "orders", "trades", "accounts", "banking", "investigations", "leverage", "audit", "health"].includes(key));
   if (roles.has("fcx_admin") || roles.has("commissioner")) return sections.filter(([key]) => !["investigations", "leverage", "settings"].includes(key));
   return sections.filter(([key]) => ["overview", "health"].includes(key));
 }
@@ -331,6 +331,52 @@ async function renderLeverage() {
     ${dataTable(["Resident / identity","Security","Side","Collateral","Leverage","Requested price","State","Submitted","Resolved"], requests, row => `<tr><td>${linkedIdentity(row)}</td><td><strong>${esc(row.ticker)}</strong><small>${esc(row.name)}</small></td><td>${esc(String(row.side || row.direction || "").toUpperCase())}</td><td>${money(row.collateral)}</td><td>${number(row.leverage)}x</td><td>${money(row.requested_price || row.entry_price)}</td><td>${esc(row.status)}</td><td>${esc(stamp(row.created_at || row.requested_at))}</td><td>${esc(stamp(row.resolved_at || row.updated_at))}</td></tr>`)} `;
 }
 
+function settlementLifecycle(rawState) {
+  const value = String(rawState || "").toUpperCase();
+  if (value === "CREATED") return "pending";
+  if (["BANK_AUTHORIZED", "BANK_DEBITED", "BANK_CREDITED", "ORDER_EXECUTED"].includes(value)) return "claimed";
+  if (value === "SETTLED") return "completed";
+  if (value === "FAILED") return "failed";
+  if (value === "REVERSED") return "cancelled";
+  return "pending";
+}
+
+function settlementDirection(row) {
+  return String(row.operation || "").toLowerCase() === "credit"
+    ? { label: "Withdraw to game bank", short: "FCX TO GAME", css: "withdrawal" }
+    : { label: "Deposit to FCX wallet", short: "GAME TO FCX", css: "deposit" };
+}
+
+async function renderBanking() {
+  const data = await cached("admin-settlements", "/admin/settlements?limit=1000");
+  const rows = data.settlements || [];
+  const lifecycleCounts = { all: rows.length, pending: 0, claimed: 0, completed: 0, failed: 0, cancelled: 0 };
+  rows.forEach(row => { lifecycleCounts[settlementLifecycle(row.state)] += 1; });
+  const recoverable = rows.filter(row => ["CREATED", "BANK_AUTHORIZED", "FAILED"].includes(String(row.state || "").toUpperCase())).length;
+  const filters = [
+    ["all", "All commands"], ["pending", "Pending"], ["claimed", "Claimed"],
+    ["completed", "Completed"], ["failed", "Failed"], ["cancelled", "Cancelled"],
+  ];
+  return `${sectionHead("FCX BANKING OPERATIONS", "Game-bank transfer command center", "Ravenhood wallet funding remains separate from the read-only Arma bank snapshot. CAD services transport commands through the existing Bank Bridge; FCX owns wallet settlement state.")}
+    <div class="settlement-filter-grid">${filters.map(([key, label]) => `<button class="settlement-filter ${state.settlementFilter === key ? "active" : ""}" data-filter="${key}"><small>${esc(label)}</small><strong>${number(lifecycleCounts[key] || 0)}</strong></button>`).join("")}</div>
+    <div class="settlement-toolbar">
+      <div><strong>${number(recoverable)} recoverable</strong><small>Pending, authorized, or failed commands may be cancelled safely. Claimed money movements are refreshed instead.</small></div>
+      <button id="settlement-refresh-all">Refresh records</button>
+      <button id="settlement-bulk-cancel" class="danger-action" ${recoverable ? "" : "disabled"}>Cancel all recoverable</button>
+    </div>
+    <div class="table-wrap settlement-ledger"><table><thead><tr><th>Created</th><th>Community / resident</th><th>Direction</th><th>Amount</th><th>Lifecycle</th><th>Bridge detail</th><th>Actions</th></tr></thead><tbody>
+      ${rows.map(row => {
+        const lifecycle = settlementLifecycle(row.state);
+        const direction = settlementDirection(row);
+        const rawState = String(row.state || "").toUpperCase();
+        const retryable = ["CREATED", "BANK_AUTHORIZED", "FAILED"].includes(rawState);
+        const refreshable = !["SETTLED", "REVERSED"].includes(rawState);
+        const failure = row.failure_message || row.failure_code || "";
+        return `<tr data-settlement-row data-lifecycle="${lifecycle}" data-settlement-id="${esc(row.settlement_id)}"><td>${esc(stamp(row.created_at))}<small>${esc(row.settlement_id)}</small></td><td><strong>${esc(row.community_id)}</strong><small>${esc(row.account_id || row.community_user_id || "Unlinked account")}</small></td><td><span class="settlement-direction ${direction.css}">${esc(direction.short)}</span><small>${esc(direction.label)}</small></td><td><strong>${money(row.amount)}</strong><small>${esc(row.currency || "FC")}</small></td><td><span class="settlement-state ${lifecycle}">${esc(lifecycle)}</span><small>${esc(rawState)}</small></td><td>${row.bank_reference ? `<strong>${esc(row.bank_reference)}</strong>` : "—"}${failure ? `<small class="failure-detail">${esc(failure)}</small>` : `<small>${esc(row.order_reference || "Awaiting bridge reference")}</small>`}</td><td><div class="settlement-actions">${refreshable ? `<button class="settlement-refresh" data-id="${esc(row.settlement_id)}">Refresh</button>` : ""}${retryable ? `<button class="settlement-retry" data-id="${esc(row.settlement_id)}">Retry</button><button class="settlement-cancel danger-action" data-id="${esc(row.settlement_id)}">Cancel</button>` : ""}</div></td></tr>`;
+      }).join("") || `<tr><td colspan="7"><div class="empty compact">No FCX wallet commands have been submitted.</div></td></tr>`}
+    </tbody></table></div>`;
+}
+
 async function renderInvestigations() {
   const data = await cached("fec-workspace", "/admin/fec/workspace");
   const accounts = data.accounts || [];
@@ -415,7 +461,7 @@ async function renderHealth() {
   return `<section class="hero"><span class="status-chip">Service healthy</span><h3>FCX is answering<br>for itself.</h3><p>The exchange database, authenticated control API, and standalone PWA are independent from CAD 1 and CAD 2.</p></section>${metrics([["Database", health.database, "Dedicated FCX connection", "up"], ["Communities", health.counts.communities, "Registry rows"], ["Pending settlements", health.counts.pending_settlements, "Awaiting terminal state"], ["Open cases", health.counts.open_investigations, "FEC docket"], ["Service", health.service, "API v1"], ["CAD dependency", "None", `${overview.communities.length} API clients`, "up"]])}`;
 }
 
-const renderers = { overview: renderOverview, engine: renderEngine, operations: renderOperations, market: renderMarket, companies: renderCompanies, securities: renderSecurities, orders: renderOrders, trades: renderTrades, accounts: renderAccounts, investigations: renderInvestigations, communities: renderCommunities, connections: renderConnections, leverage: renderLeverage, settings: renderSettings, audit: renderAudit, health: renderHealth };
+const renderers = { overview: renderOverview, engine: renderEngine, operations: renderOperations, market: renderMarket, companies: renderCompanies, securities: renderSecurities, orders: renderOrders, trades: renderTrades, accounts: renderAccounts, banking: renderBanking, investigations: renderInvestigations, communities: renderCommunities, connections: renderConnections, leverage: renderLeverage, settings: renderSettings, audit: renderAudit, health: renderHealth };
 
 function formBody(form) { return Object.fromEntries(new FormData(form)); }
 function optionalNumber(value) { return value === "" || value === null || value === undefined ? null : Number(value); }
@@ -430,6 +476,29 @@ async function mutation(path, method, body, message, section = state.section) {
 }
 
 function bindActions() {
+  const applySettlementFilter = filter => {
+    state.settlementFilter = filter || "all";
+    document.querySelectorAll(".settlement-filter").forEach(button => button.classList.toggle("active", button.dataset.filter === state.settlementFilter));
+    document.querySelectorAll("[data-settlement-row]").forEach(row => {
+      row.hidden = state.settlementFilter !== "all" && row.dataset.lifecycle !== state.settlementFilter;
+    });
+  };
+  document.querySelectorAll(".settlement-filter").forEach(button => button.addEventListener("click", () => applySettlementFilter(button.dataset.filter)));
+  applySettlementFilter(state.settlementFilter);
+  $("#settlement-refresh-all")?.addEventListener("click", async () => {
+    state.cache.delete("admin-settlements");
+    await openSection("banking", true);
+  });
+  $("#settlement-bulk-cancel")?.addEventListener("click", async () => {
+    if (!confirm("Cancel every recoverable pending, authorized, or failed FCX wallet transfer? Claimed bank movements will not be cancelled.")) return;
+    await mutation("/admin/settlements/bulk-cancel", "POST", { reason: "Bulk-cancelled by authorized FEC operator" }, "Recoverable wallet transfers cancelled.", "banking");
+  });
+  document.querySelectorAll(".settlement-refresh").forEach(button => button.addEventListener("click", () => mutation(`/admin/settlements/${encodeURIComponent(button.dataset.id)}/refresh`, "POST", {}, "Settlement refreshed from its CAD transport.", "banking")));
+  document.querySelectorAll(".settlement-retry").forEach(button => button.addEventListener("click", () => mutation(`/admin/settlements/${encodeURIComponent(button.dataset.id)}/retry`, "POST", {}, "Settlement made available for Bank Bridge retry.", "banking")));
+  document.querySelectorAll(".settlement-cancel").forEach(button => button.addEventListener("click", async () => {
+    if (!confirm("Cancel this recoverable FCX wallet transfer?")) return;
+    await mutation(`/admin/settlements/${encodeURIComponent(button.dataset.id)}/cancel`, "POST", { reason: "Cancelled by authorized FEC operator" }, "Settlement cancelled and any reserved FCX funds restored.", "banking");
+  }));
   $("#community-form")?.addEventListener("submit", async event => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
     try { await request("/admin/communities", { method: "POST", body: Object.fromEntries(form) }); state.cache.clear(); notice("Community registered. Generate its API credential next."); await openSection("communities", true); } catch (error) { notice(error.message, true); }

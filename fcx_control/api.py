@@ -157,6 +157,18 @@ class SettlementCallback(BaseModel):
     response: dict[str, Any] = Field(default_factory=dict)
 
 
+class SettlementAdminAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(default="Operator action", max_length=1000)
+
+
+class SettlementBulkAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    settlement_ids: list[str] = Field(default_factory=list, max_length=500)
+    community_id: str = Field(default="", max_length=120)
+    reason: str = Field(default="Bulk operator action", max_length=1000)
+
+
 class TradeOrderRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     idempotency_key: str = Field(min_length=8, max_length=200)
@@ -441,7 +453,12 @@ def revoke_credential(credential_id: str, request: Request, user: dict[str, Any]
 
 
 @router.get("/admin/settlements")
-def admin_settlements(state: str = "", community_id: str = "", _: dict[str, Any] = Depends(require_roles(*ADMIN_ROLES))) -> dict[str, Any]:
+def admin_settlements(
+    state: str = "",
+    community_id: str = "",
+    limit: int = 500,
+    _: dict[str, Any] = Depends(require_roles(*ADMIN_ROLES)),
+) -> dict[str, Any]:
     clauses: list[str] = []
     values: dict[str, Any] = {}
     if state:
@@ -451,9 +468,15 @@ def admin_settlements(state: str = "", community_id: str = "", _: dict[str, Any]
         clauses.append("community_id=:community")
         values["community"] = community_id
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    values["limit"] = max(1, min(limit, 2000))
     with transaction() as connection:
-        rows = all_rows(connection, f"SELECT * FROM fcx_settlements{where} ORDER BY id DESC LIMIT 500", values)
-    return {"ok": True, "settlements": rows}
+        rows = all_rows(connection, f"SELECT * FROM fcx_settlements{where} ORDER BY id DESC LIMIT :limit", values)
+        counts = all_rows(connection, "SELECT state,COUNT(*) AS count FROM fcx_settlements GROUP BY state")
+    return {
+        "ok": True,
+        "settlements": rows,
+        "counts": {str(row["state"]).lower(): int(row["count"]) for row in counts},
+    }
 
 
 @router.get("/admin/audit")
@@ -1270,6 +1293,152 @@ def _settlement_response(connection: Any, settlement_id: str, community_id: str)
     return row
 
 
+def _settlement_metadata(settlement: dict[str, Any]) -> dict[str, Any]:
+    raw = settlement.get("request_json") or {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        decoded = json.loads(str(raw))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _is_wallet_transfer(settlement: dict[str, Any]) -> bool:
+    metadata = _settlement_metadata(settlement)
+    return str(metadata.get("kind") or "").lower() == "wallet_transfer"
+
+
+def _wallet_market_account(connection: Any, account_id: str, *, lock: bool = False) -> dict[str, Any]:
+    suffix = " FOR UPDATE OF ma" if lock else ""
+    account = one(
+        connection,
+        """SELECT ma.id AS market_account_id,ma.cash_balance,ma.status
+           FROM fcx_ravenhood_accounts ra
+           JOIN market_accounts ma ON ma.user_id=ra.id
+           WHERE ra.account_id=:account""" + suffix,
+        {"account": account_id},
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="FCX wallet account was not found")
+    return account
+
+
+def _apply_wallet_transfer_state(
+    connection: Any,
+    settlement: dict[str, Any],
+    requested_state: str,
+) -> str:
+    """Apply wallet effects exactly once and return the persisted settlement state."""
+    if not _is_wallet_transfer(settlement):
+        return requested_state
+    operation = str(settlement.get("operation") or "").lower()
+    amount = _money(settlement.get("amount"))
+    settlement_id = str(settlement["settlement_id"])
+    account = _wallet_market_account(connection, str(settlement["account_id"]), lock=True)
+
+    if operation == "debit" and requested_state in {"BANK_DEBITED", "SETTLED"}:
+        if not settlement.get("wallet_applied_at"):
+            execute(
+                connection,
+                "UPDATE market_accounts SET cash_balance=cash_balance+:amount,updated_at=NOW() WHERE id=:id",
+                {"amount": amount, "id": account["market_account_id"]},
+            )
+            execute(
+                connection,
+                "UPDATE fcx_settlements SET wallet_applied_at=NOW() WHERE settlement_id=:settlement",
+                {"settlement": settlement_id},
+            )
+        return "SETTLED"
+
+    if operation == "credit" and requested_state in {"BANK_CREDITED", "SETTLED"}:
+        if not settlement.get("wallet_applied_at"):
+            execute(
+                connection,
+                "UPDATE fcx_settlements SET wallet_applied_at=NOW() WHERE settlement_id=:settlement",
+                {"settlement": settlement_id},
+            )
+        return "SETTLED"
+
+    if operation == "credit" and requested_state in {"FAILED", "REVERSED"}:
+        if settlement.get("wallet_reserved_at") and not settlement.get("wallet_applied_at") and not settlement.get("wallet_reversed_at"):
+            execute(
+                connection,
+                "UPDATE market_accounts SET cash_balance=cash_balance+:amount,updated_at=NOW() WHERE id=:id",
+                {"amount": amount, "id": account["market_account_id"]},
+            )
+            execute(
+                connection,
+                "UPDATE fcx_settlements SET wallet_reversed_at=NOW() WHERE settlement_id=:settlement",
+                {"settlement": settlement_id},
+            )
+    return requested_state
+
+
+def _prepare_wallet_transfer_retry(connection: Any, settlement: dict[str, Any]) -> None:
+    """Re-reserve a restored withdrawal before an operator retries its bridge command."""
+    if not _is_wallet_transfer(settlement) or str(settlement.get("operation") or "").lower() != "credit":
+        return
+    if not settlement.get("wallet_reversed_at") or settlement.get("wallet_applied_at"):
+        return
+    amount = _money(settlement.get("amount"))
+    account = _wallet_market_account(connection, str(settlement["account_id"]), lock=True)
+    if _money(account.get("cash_balance")) < amount:
+        raise HTTPException(status_code=409, detail="Insufficient FCX wallet cash to retry this withdrawal")
+    execute(
+        connection,
+        "UPDATE market_accounts SET cash_balance=cash_balance-:amount,updated_at=NOW() WHERE id=:id",
+        {"amount": amount, "id": account["market_account_id"]},
+    )
+    execute(
+        connection,
+        """UPDATE fcx_settlements SET wallet_reserved_at=NOW(),wallet_reversed_at=NULL,
+           cancelled_at=NULL,cancel_reason='',failure_code='',failure_message='',updated_at=NOW()
+           WHERE settlement_id=:settlement""",
+        {"settlement": settlement["settlement_id"]},
+    )
+
+
+def _cancel_settlement(
+    connection: Any,
+    settlement: dict[str, Any],
+    *,
+    reason: str,
+    actor_id: str,
+    actor_role: str,
+    request: Request | None = None,
+) -> dict[str, Any]:
+    current_state = str(settlement.get("state") or "")
+    if current_state in {"SETTLED", "REVERSED"}:
+        return settlement
+    if current_state not in {"CREATED", "BANK_AUTHORIZED", "FAILED"}:
+        raise HTTPException(
+            status_code=409,
+            detail="This command has already moved money and cannot be safely cancelled",
+        )
+    _apply_wallet_transfer_state(connection, settlement, "REVERSED")
+    execute(
+        connection,
+        """UPDATE fcx_settlements SET state='REVERSED',cancelled_at=NOW(),cancel_reason=:reason,
+           failure_code='',failure_message='',updated_at=NOW() WHERE settlement_id=:settlement""",
+        {"reason": reason[:1000], "settlement": settlement["settlement_id"]},
+    )
+    audit(
+        connection,
+        actor_type="admin",
+        actor_id=actor_id,
+        actor_role=actor_role,
+        action="settlement.cancelled",
+        target_type="settlement",
+        target_id=str(settlement["settlement_id"]),
+        previous={"state": current_state},
+        new={"state": "REVERSED"},
+        reason=reason,
+        request=request,
+    )
+    return _settlement_response(connection, str(settlement["settlement_id"]), str(settlement["community_id"]))
+
+
 def _community_bank_bridge(community_id: str) -> tuple[str, str]:
     with transaction() as connection:
         community = one(
@@ -1331,9 +1500,36 @@ def _apply_bank_reply(
     if next_state not in allowed_states:
         next_state = "BANK_AUTHORIZED"
     with transaction() as connection:
-        current = _settlement_response(connection, settlement_id, community_id)
+        current = one(
+            connection,
+            """SELECT * FROM fcx_settlements
+               WHERE settlement_id=:settlement AND community_id=:community
+               FOR UPDATE""",
+            {"settlement": settlement_id, "community": community_id},
+        )
+        if not current:
+            raise HTTPException(status_code=404, detail="Settlement not found")
         if str(current["state"]) in {"SETTLED", "REVERSED"}:
             return current
+        # Bridge callbacks and status refreshes can overlap.  Never let a
+        # delayed response move a command backwards after a newer response
+        # has already advanced it (for example BANK_DEBITED ->
+        # BANK_AUTHORIZED).  This also keeps wallet application strictly
+        # one-way while the row is locked.
+        state_progress = {
+            "CREATED": 0,
+            "FAILED": 0,
+            "BANK_AUTHORIZED": 1,
+            "BANK_DEBITED": 2,
+            "BANK_CREDITED": 2,
+            "ORDER_EXECUTED": 3,
+            "SETTLED": 4,
+            "REVERSED": 4,
+        }
+        current_state = str(current["state"])
+        if state_progress.get(next_state, 0) < state_progress.get(current_state, 0):
+            return current
+        next_state = _apply_wallet_transfer_state(connection, current, next_state)
         execute(
             connection,
             """UPDATE fcx_settlements SET state=:state,bank_reference=:reference,
@@ -1366,9 +1562,10 @@ def _apply_bank_reply(
 @router.post("/community/settlements")
 def create_settlement(payload: SettlementRequest, principal: dict[str, Any] = Depends(require_community_scopes("settlement:write"))) -> dict[str, Any]:
     community_id = str(principal["community_id"])
-    if payload.operation == "debit" and (not principal["trading_enabled"] or not principal["buy_enabled"]):
+    wallet_transfer = str(payload.metadata.get("kind") or "").lower() == "wallet_transfer"
+    if not wallet_transfer and payload.operation == "debit" and (not principal["trading_enabled"] or not principal["buy_enabled"]):
         raise HTTPException(status_code=403, detail="Buying is disabled for this community")
-    if payload.operation == "credit" and (not principal["trading_enabled"] or not principal["sell_enabled"]):
+    if not wallet_transfer and payload.operation == "credit" and (not principal["trading_enabled"] or not principal["sell_enabled"]):
         raise HTTPException(status_code=403, detail="Selling is disabled for this community")
     with transaction() as connection:
         existing = one(connection, "SELECT * FROM fcx_settlements WHERE community_id=:community AND idempotency_key=:key", {"community": community_id, "key": payload.idempotency_key})
@@ -1378,14 +1575,25 @@ def create_settlement(payload: SettlementRequest, principal: dict[str, Any] = De
         if not link:
             raise HTTPException(status_code=403, detail="Ravenhood account is not linked to this community user")
         settlement_id = "fcx_txn_" + secrets.token_urlsafe(18).replace("-", "").replace("_", "")
+        wallet_reserved_at = None
+        if wallet_transfer and payload.operation == "credit":
+            wallet = _wallet_market_account(connection, payload.account_id, lock=True)
+            if _money(wallet.get("cash_balance")) < _money(payload.amount):
+                raise HTTPException(status_code=409, detail="Insufficient FCX wallet cash for this withdrawal")
+            execute(
+                connection,
+                "UPDATE market_accounts SET cash_balance=cash_balance-:amount,updated_at=NOW() WHERE id=:id",
+                {"amount": _money(payload.amount), "id": wallet["market_account_id"]},
+            )
+            wallet_reserved_at = utcnow()
         execute(
             connection,
             """INSERT INTO fcx_settlements
                (settlement_id,idempotency_key,community_id,account_id,community_user_id,
-                operation,amount,currency,state,order_reference,request_json,created_at,updated_at)
+                operation,amount,currency,state,order_reference,request_json,wallet_reserved_at,created_at,updated_at)
                VALUES (:settlement,:key,:community,:account,:user,:operation,:amount,:currency,
-                'CREATED',:order_reference,CAST(:request AS jsonb),:now,:now)""",
-            {"settlement": settlement_id, "key": payload.idempotency_key, "community": community_id, "account": payload.account_id, "user": payload.community_user_id, "operation": payload.operation, "amount": payload.amount, "currency": payload.currency, "order_reference": payload.order_reference, "request": json.dumps(payload.metadata, default=str), "now": utcnow()},
+                'CREATED',:order_reference,CAST(:request AS jsonb),:wallet_reserved_at,:now,:now)""",
+            {"settlement": settlement_id, "key": payload.idempotency_key, "community": community_id, "account": payload.account_id, "user": payload.community_user_id, "operation": payload.operation, "amount": payload.amount, "currency": payload.currency, "order_reference": payload.order_reference, "request": json.dumps(payload.metadata, default=str), "wallet_reserved_at": wallet_reserved_at, "now": utcnow()},
         )
         audit(connection, actor_type="community", actor_id=community_id, action="settlement.created", target_type="settlement", target_id=settlement_id, new=payload.model_dump())
         result = _settlement_response(connection, settlement_id, community_id)
@@ -1429,7 +1637,17 @@ def execute_settlement(settlement_id: str, principal: dict[str, Any] = Depends(r
         )
     except HTTPException as exc:
         with transaction() as connection:
-            execute(connection, "UPDATE fcx_settlements SET state='FAILED',failure_code='BANK_BRIDGE_UNAVAILABLE',failure_message=:message,updated_at=NOW() WHERE settlement_id=:settlement AND state IN ('CREATED','FAILED')", {"message": str(exc)[:2000], "settlement": settlement_id})
+            current = one(
+                connection,
+                """SELECT * FROM fcx_settlements
+                   WHERE settlement_id=:settlement AND community_id=:community
+                   FOR UPDATE""",
+                {"settlement": settlement_id, "community": community_id},
+            )
+            if not current:
+                raise HTTPException(status_code=404, detail="Settlement not found")
+            failed_state = _apply_wallet_transfer_state(connection, current, "FAILED")
+            execute(connection, "UPDATE fcx_settlements SET state=:state,failure_code='BANK_BRIDGE_UNAVAILABLE',failure_message=:message,updated_at=NOW() WHERE settlement_id=:settlement AND state IN ('CREATED','FAILED')", {"state": failed_state, "message": str(exc)[:2000], "settlement": settlement_id})
         raise
     result = _apply_bank_reply(
         community_id=community_id,
@@ -1475,21 +1693,146 @@ def settlement_callback(settlement_id: str, payload: SettlementCallback, princip
     }
     with transaction() as connection:
         current = _settlement_response(connection, settlement_id, community_id)
-        if current["state"] == payload.state:
-            return {"ok": True, "idempotent_replay": True, "settlement": current}
-        if payload.state not in transitions.get(str(current["state"]), set()):
-            raise HTTPException(status_code=409, detail=f"Invalid settlement transition {current['state']} -> {payload.state}")
+    if current["state"] == payload.state:
+        return {"ok": True, "idempotent_replay": True, "settlement": current}
+    if payload.state not in transitions.get(str(current["state"]), set()):
+        raise HTTPException(status_code=409, detail=f"Invalid settlement transition {current['state']} -> {payload.state}")
+    updated = _apply_bank_reply(
+        community_id=community_id,
+        settlement_id=settlement_id,
+        reply={
+            "state": payload.state,
+            "bank_reference": payload.bank_reference,
+            "failure_code": payload.failure_code,
+            "failure_message": payload.failure_message,
+            **payload.response,
+        },
+        audit_action="settlement.state_changed",
+    )
+    return {"ok": True, "idempotent_replay": False, "settlement": updated}
+
+
+@router.post("/admin/settlements/{settlement_id}/retry")
+def admin_retry_settlement(
+    settlement_id: str,
+    payload: SettlementAdminAction,
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf(*ADMIN_ROLES)),
+) -> dict[str, Any]:
+    with transaction() as connection:
+        settlement = one(connection, "SELECT * FROM fcx_settlements WHERE settlement_id=:settlement FOR UPDATE", {"settlement": settlement_id})
+        if not settlement:
+            raise HTTPException(status_code=404, detail="Settlement not found")
+        state = str(settlement.get("state") or "")
+        if state in {"SETTLED", "REVERSED"}:
+            raise HTTPException(status_code=409, detail=f"A {state.lower()} command cannot be retried")
+        if state not in {"CREATED", "FAILED", "BANK_AUTHORIZED"}:
+            raise HTTPException(status_code=409, detail="This command has already moved money; refresh its status instead")
+        _prepare_wallet_transfer_retry(connection, settlement)
         execute(
             connection,
-            """UPDATE fcx_settlements SET state=:state,bank_reference=:reference,
-               failure_code=:failure_code,failure_message=:failure_message,
-               response_json=CAST(:response AS jsonb),updated_at=NOW()
-               WHERE settlement_id=:settlement AND community_id=:community""",
-            {"state": payload.state, "reference": payload.bank_reference, "failure_code": payload.failure_code, "failure_message": payload.failure_message, "response": json.dumps(payload.response, default=str), "settlement": settlement_id, "community": community_id},
+            "UPDATE fcx_settlements SET state=:state,cancelled_at=NULL,cancel_reason='',failure_code='',failure_message='',updated_at=NOW() WHERE settlement_id=:settlement",
+            {"state": "BANK_AUTHORIZED" if state == "BANK_AUTHORIZED" else "CREATED", "settlement": settlement_id},
         )
-        audit(connection, actor_type="community", actor_id=community_id, action="settlement.state_changed", target_type="settlement", target_id=settlement_id, previous={"state": current["state"]}, new=payload.model_dump())
-        updated = _settlement_response(connection, settlement_id, community_id)
-    return {"ok": True, "idempotent_replay": False, "settlement": updated}
+        community_id = str(settlement["community_id"])
+        settlement = _settlement_response(connection, settlement_id, community_id)
+
+    if state == "BANK_AUTHORIZED":
+        reply = _bank_bridge_request(community_id=community_id, settlement_id=settlement_id, method="GET")
+    else:
+        reply = _bank_bridge_request(
+            community_id=community_id,
+            settlement_id=settlement_id,
+            method="POST",
+            idempotency_key=str(settlement["idempotency_key"]),
+            payload={
+                "settlement_id": settlement_id,
+                "idempotency_key": settlement["idempotency_key"],
+                "community_id": community_id,
+                "community_user_id": settlement["community_user_id"],
+                "ravenhood_account_id": settlement["account_id"],
+                "operation": settlement["operation"],
+                "amount": str(settlement["amount"]),
+                "currency": settlement["currency"],
+                "order_reference": settlement["order_reference"],
+            },
+        )
+    updated = _apply_bank_reply(
+        community_id=community_id,
+        settlement_id=settlement_id,
+        reply=reply,
+        audit_action="settlement.operator_retried",
+    )
+    with transaction() as connection:
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="settlement.retry_requested", target_type="settlement", target_id=settlement_id, reason=payload.reason, request=request)
+    return {"ok": True, "settlement": updated}
+
+
+@router.post("/admin/settlements/{settlement_id}/refresh")
+def admin_refresh_settlement(
+    settlement_id: str,
+    payload: SettlementAdminAction,
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf(*ADMIN_ROLES)),
+) -> dict[str, Any]:
+    with transaction() as connection:
+        settlement = one(connection, "SELECT * FROM fcx_settlements WHERE settlement_id=:settlement", {"settlement": settlement_id})
+    if not settlement:
+        raise HTTPException(status_code=404, detail="Settlement not found")
+    if str(settlement["state"]) in {"SETTLED", "REVERSED"}:
+        return {"ok": True, "settlement": settlement}
+    community_id = str(settlement["community_id"])
+    reply = _bank_bridge_request(community_id=community_id, settlement_id=settlement_id, method="GET")
+    updated = _apply_bank_reply(community_id=community_id, settlement_id=settlement_id, reply=reply, audit_action="settlement.operator_refreshed")
+    with transaction() as connection:
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="settlement.refresh_requested", target_type="settlement", target_id=settlement_id, reason=payload.reason, request=request)
+    return {"ok": True, "settlement": updated}
+
+
+@router.post("/admin/settlements/{settlement_id}/cancel")
+def admin_cancel_settlement(
+    settlement_id: str,
+    payload: SettlementAdminAction,
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf(*ADMIN_ROLES)),
+) -> dict[str, Any]:
+    with transaction() as connection:
+        settlement = one(connection, "SELECT * FROM fcx_settlements WHERE settlement_id=:settlement FOR UPDATE", {"settlement": settlement_id})
+        if not settlement:
+            raise HTTPException(status_code=404, detail="Settlement not found")
+        updated = _cancel_settlement(connection, settlement, reason=payload.reason, actor_id=str(user["id"]), actor_role=",".join(user["roles"]), request=request)
+    return {"ok": True, "settlement": updated}
+
+
+@router.post("/admin/settlements/bulk-cancel")
+def admin_bulk_cancel_settlements(
+    payload: SettlementBulkAction,
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf(*ADMIN_ROLES)),
+) -> dict[str, Any]:
+    cancelled: list[str] = []
+    skipped: list[dict[str, str]] = []
+    with transaction() as connection:
+        if payload.settlement_ids:
+            candidates = []
+            for settlement_id in payload.settlement_ids:
+                row = one(connection, "SELECT * FROM fcx_settlements WHERE settlement_id=:settlement FOR UPDATE", {"settlement": settlement_id})
+                if row:
+                    candidates.append(row)
+        else:
+            params: dict[str, Any] = {}
+            community_clause = ""
+            if payload.community_id:
+                community_clause = " AND community_id=:community"
+                params["community"] = payload.community_id
+            candidates = all_rows(connection, "SELECT * FROM fcx_settlements WHERE state IN ('CREATED','BANK_AUTHORIZED','FAILED')" + community_clause + " ORDER BY id DESC LIMIT 500 FOR UPDATE", params)
+        for settlement in candidates:
+            try:
+                _cancel_settlement(connection, settlement, reason=payload.reason, actor_id=str(user["id"]), actor_role=",".join(user["roles"]), request=request)
+                cancelled.append(str(settlement["settlement_id"]))
+            except HTTPException as exc:
+                skipped.append({"settlement_id": str(settlement["settlement_id"]), "reason": str(exc.detail)})
+    return {"ok": True, "cancelled": cancelled, "skipped": skipped, "cancelled_count": len(cancelled)}
 
 
 def _money(value: Any) -> Decimal:
@@ -1522,13 +1865,14 @@ def _linked_market_account(
     community_user_id: str,
     account_id: str,
     lock: bool = False,
+    enforce_restrictions: bool = True,
 ) -> dict[str, Any]:
     suffix = " FOR UPDATE OF ma" if lock else ""
     row = one(
         connection,
         """SELECT ra.id AS ravenhood_internal_id,ra.account_id,ra.display_name,
                   ra.status AS ravenhood_status,rl.verified,rl.active AS link_active,
-                  ma.id AS market_account_id,ma.status AS market_status
+                  ma.id AS market_account_id,ma.status AS market_status,ma.cash_balance
            FROM fcx_ravenhood_links rl
            JOIN fcx_ravenhood_accounts ra ON ra.account_id=rl.account_id
            JOIN market_accounts ma ON ma.user_id=ra.id
@@ -1540,15 +1884,17 @@ def _linked_market_account(
         raise HTTPException(status_code=403, detail="Ravenhood account is not linked to this community user")
     if not row.get("verified") or not row.get("link_active"):
         raise HTTPException(status_code=403, detail="A verified active Ravenhood link is required")
-    if str(row.get("ravenhood_status")) != "active" or str(row.get("market_status")) != "active":
-        raise HTTPException(status_code=403, detail="Ravenhood trading account is restricted")
-    restriction = one(
+    restrictions = all_rows(
         connection,
-        """SELECT id,scope,reason FROM market_account_trading_restrictions
-           WHERE account_id=:account AND status='active' LIMIT 1""",
+        """SELECT id,scope,reason,created_at FROM market_account_trading_restrictions
+           WHERE account_id=:account AND status='active' ORDER BY id DESC""",
         {"account": row["market_account_id"]},
     )
-    if restriction:
+    row["trading_restrictions"] = restrictions
+    row["is_restricted"] = bool(restrictions)
+    row["restriction_scope"] = str((restrictions[0] if restrictions else {}).get("scope") or "")
+    row["restriction_reason"] = str((restrictions[0] if restrictions else {}).get("reason") or "")
+    if enforce_restrictions and restrictions:
         raise HTTPException(status_code=403, detail="Ravenhood trading account is restricted by FEC")
     return row
 
@@ -1809,8 +2155,43 @@ def _finalize_sell_credit(trade_request_id: str, community_id: str) -> None:
         audit(connection, actor_type="system", actor_id="fcx-trade", action="trade.sell_settled", target_type="trade_request", target_id=trade_request_id, new={"bank_reference": settlement.get("bank_reference", "")})
 
 
+MARKET_HISTORY_WINDOWS: dict[str, timedelta] = {
+    "live": timedelta(hours=6),
+    "15m": timedelta(minutes=15),
+    "15min": timedelta(minutes=15),
+    "1h": timedelta(hours=1),
+    "1hour": timedelta(hours=1),
+    "1d": timedelta(days=1),
+    "1day": timedelta(days=1),
+    "1w": timedelta(days=7),
+    "1week": timedelta(days=7),
+    "1m": timedelta(days=30),
+    "1month": timedelta(days=30),
+    "1y": timedelta(days=365),
+    "1year": timedelta(days=365),
+}
+
+
+def _sample_history(rows: list[dict[str, Any]], maximum: int = 720) -> list[dict[str, Any]]:
+    if len(rows) <= maximum:
+        return rows
+    step = (len(rows) - 1) / float(maximum - 1)
+    indexes = sorted({round(index * step) for index in range(maximum)})
+    return [rows[index] for index in indexes]
+
+
 @router.get("/community/market")
-def community_market(principal: dict[str, Any] = Depends(require_community_scopes("market:read"))) -> dict[str, Any]:
+def community_market(
+    ticker: str = "",
+    history_range: str = "live",
+    principal: dict[str, Any] = Depends(require_community_scopes("market:read")),
+) -> dict[str, Any]:
+    normalized_range = str(history_range or "live").strip().lower()
+    if normalized_range not in MARKET_HISTORY_WINDOWS:
+        raise HTTPException(status_code=400, detail="Unsupported market history range")
+    selected_ticker = str(ticker or "").strip().upper()
+    history_now = utcnow()
+    history_since = history_now - MARKET_HISTORY_WINDOWS[normalized_range]
     with transaction() as connection:
         securities = all_rows(
             connection,
@@ -1838,31 +2219,38 @@ def community_market(principal: dict[str, Any] = Depends(require_community_scope
         history_rows = all_rows(
             connection,
             """WITH execution_flow AS (
-                   SELECT security_id,created_at,
-                          SUM(COALESCE(buy_volume,0)) AS buy_volume,
-                          SUM(COALESCE(sell_volume,0)) AS sell_volume,
-                          SUM(COALESCE(buy_trade_count,0)) AS buy_trade_count,
-                          SUM(COALESCE(sell_trade_count,0)) AS sell_trade_count,
-                          SUM((COALESCE(buy_volume,0)+COALESCE(sell_volume,0))*COALESCE(reference_price,0)) AS traded_notional
+                   SELECT security_id,date_trunc('minute',created_at) AS minute_bucket,
+                           SUM(COALESCE(buy_volume,0)) AS buy_volume,
+                           SUM(COALESCE(sell_volume,0)) AS sell_volume,
+                           SUM(COALESCE(buy_trade_count,0)) AS buy_trade_count,
+                           SUM(COALESCE(sell_trade_count,0)) AS sell_trade_count,
+                           SUM((COALESCE(buy_volume,0)+COALESCE(sell_volume,0))*COALESCE(reference_price,0)) AS traded_notional
                    FROM market_system_trades
-                   WHERE COALESCE(buy_volume,0)>0 OR COALESCE(sell_volume,0)>0
-                   GROUP BY security_id,created_at
+                   WHERE created_at>=:since
+                     AND (COALESCE(buy_volume,0)>0 OR COALESCE(sell_volume,0)>0)
+                   GROUP BY security_id,date_trunc('minute',created_at)
                ), ranked_history AS (
                    SELECT s.ticker,h.price,h.source,h.recorded_at,
                           COALESCE(f.buy_volume,0) AS buy_volume,
                           COALESCE(f.sell_volume,0) AS sell_volume,
                           COALESCE(f.buy_trade_count,0) AS buy_trade_count,
-                          COALESCE(f.sell_trade_count,0) AS sell_trade_count,
-                          COALESCE(f.traded_notional,0) AS traded_notional,
-                          ROW_NUMBER() OVER (PARTITION BY h.security_id ORDER BY h.id DESC) AS position
+                           COALESCE(f.sell_trade_count,0) AS sell_trade_count,
+                           COALESCE(f.traded_notional,0) AS traded_notional,
+                           ROW_NUMBER() OVER (PARTITION BY h.security_id ORDER BY h.id DESC) AS position
                    FROM market_price_history h
                    JOIN market_securities s ON s.id=h.security_id
-                   LEFT JOIN execution_flow f ON f.security_id=h.security_id AND f.created_at=h.recorded_at
+                   LEFT JOIN execution_flow f ON f.security_id=h.security_id
+                    AND f.minute_bucket=date_trunc('minute',h.recorded_at)
                    WHERE s.active=1 AND s.lifecycle_status='active'
+                     AND h.recorded_at>=:since
+                     AND (:ticker='' OR UPPER(s.ticker)=:ticker)
                )
                SELECT ticker,price,source,recorded_at,buy_volume,sell_volume,
                       buy_trade_count,sell_trade_count,traded_notional
-               FROM ranked_history WHERE position<=240 ORDER BY ticker,recorded_at""",
+               FROM ranked_history
+               WHERE (:ticker<>'' OR position<=240)
+               ORDER BY ticker,recorded_at""",
+            {"since": history_since, "ticker": selected_ticker},
         )
         index_funds = all_rows(
             connection,
@@ -1905,6 +2293,8 @@ def community_market(principal: dict[str, Any] = Depends(require_community_scope
             if cumulative_volume[ticker] > 0 else None
         )
         price_history.setdefault(ticker, []).append(row)
+    for history_ticker, rows in list(price_history.items()):
+        price_history[history_ticker] = _sample_history(rows)
     members_by_fund: dict[int, list[dict[str, Any]]] = {}
     for row in member_rows:
         fund_id = int(row.pop("fund_id"))
@@ -1943,6 +2333,11 @@ def community_market(principal: dict[str, Any] = Depends(require_community_scope
         "community_id": principal["community_id"],
         "permissions": {"trading": principal["trading_enabled"], "buy": principal["buy_enabled"], "sell": principal["sell_enabled"]},
         "market": {row["setting_key"]: row["setting_value"] for row in settings_rows},
+        "history_range": normalized_range,
+        "history_range_start": history_since,
+        "history_range_end": history_now,
+        "history_window_start": history_since,
+        "selected_ticker": selected_ticker,
         "securities": securities,
         "anonymous_trade_tape": trade_tape,
         "price_history": price_history,
@@ -1964,7 +2359,13 @@ def community_portfolio(
 ) -> dict[str, Any]:
     community_id = str(principal["community_id"])
     with transaction() as connection:
-        account = _linked_market_account(connection, community_id=community_id, community_user_id=community_user_id, account_id=account_id)
+        account = _linked_market_account(
+            connection,
+            community_id=community_id,
+            community_user_id=community_user_id,
+            account_id=account_id,
+            enforce_restrictions=False,
+        )
         holdings = all_rows(
             connection,
             """SELECT s.ticker,s.name,h.quantity,h.reserved_quantity,h.average_cost,s.price,
