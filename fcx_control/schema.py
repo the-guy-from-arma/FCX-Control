@@ -215,20 +215,25 @@ def _ensure_bootstrap_admin(connection, now: datetime) -> None:
         )
 
 
-def _ensure_bootstrap_community_credential(connection, now: datetime) -> None:
-    community_id = settings.bootstrap_community_id
-    presented = settings.bootstrap_community_api_key
+def _ensure_community_credential(
+    connection,
+    now: datetime,
+    community_id: str,
+    community_name: str,
+    presented: str,
+    variable_prefix: str,
+) -> None:
     if not community_id and not presented:
         return
     if not community_id or not presented:
         raise RuntimeError(
-            "FCX_BOOTSTRAP_COMMUNITY_ID and FCX_BOOTSTRAP_COMMUNITY_API_KEY must be configured together"
+            f"{variable_prefix}_COMMUNITY_ID and {variable_prefix}_COMMUNITY_API_KEY must be configured together"
         )
     if "." not in presented:
-        raise RuntimeError("FCX_BOOTSTRAP_COMMUNITY_API_KEY must use the credential_id.secret format")
+        raise RuntimeError(f"{variable_prefix}_COMMUNITY_API_KEY must use the credential_id.secret format")
     credential_id, secret = presented.split(".", 1)
     if not credential_id.startswith("fcx_") or not secret:
-        raise RuntimeError("FCX_BOOTSTRAP_COMMUNITY_API_KEY is malformed")
+        raise RuntimeError(f"{variable_prefix}_COMMUNITY_API_KEY is malformed")
 
     execute(
         connection,
@@ -240,9 +245,28 @@ def _ensure_bootstrap_community_credential(connection, now: datetime) -> None:
             ON CONFLICT(community_id) DO NOTHING""",
         {
             "community_id": community_id,
-            "community_name": settings.bootstrap_community_name or community_id,
+            "community_name": community_name or community_id,
             "now": now,
         },
+    )
+
+
+def _ensure_bootstrap_community_credentials(connection, now: datetime) -> None:
+    _ensure_community_credential(
+        connection,
+        now,
+        settings.bootstrap_community_id,
+        settings.bootstrap_community_name,
+        settings.bootstrap_community_api_key,
+        "FCX_BOOTSTRAP",
+    )
+    _ensure_community_credential(
+        connection,
+        now,
+        settings.bootstrap_cad2_community_id,
+        settings.bootstrap_cad2_community_name,
+        settings.bootstrap_cad2_community_api_key,
+        "FCX_BOOTSTRAP_CAD2",
     )
     execute(
         connection,
@@ -274,7 +298,7 @@ def ensure_identity_schema() -> None:
             if not _requires_exchange_schema(statement):
                 execute(connection, statement)
         _ensure_bootstrap_admin(connection, now)
-        _ensure_bootstrap_community_credential(connection, now)
+        _ensure_bootstrap_community_credentials(connection, now)
 
 
 def ensure_schema() -> None:
@@ -283,4 +307,4 @@ def ensure_schema() -> None:
         for statement in DDL:
             execute(connection, statement)
         _ensure_bootstrap_admin(connection, now)
-        _ensure_bootstrap_community_credential(connection, now)
+        _ensure_bootstrap_community_credentials(connection, now)
