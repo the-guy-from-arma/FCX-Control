@@ -1463,9 +1463,12 @@ def _minute_cycle(db: Any, config: EngineConfig, cycle_id: int, seed: int) -> di
         )
         volume = flow["buy"] + flow["sell"] + human_buy + human_sell
         total_volume += volume * quote.old_price
-        if abs(quote.new_price - quote.old_price) >= 0.00005:
+        price_changed = abs(quote.new_price - quote.old_price) >= 0.00005
+        if price_changed:
             db.execute("UPDATE market_securities SET previous_price=price,price=?,updated_at=? WHERE id=?", (quote.new_price, timestamp, security_id))
+        if price_changed or volume > 0:
             db.execute("INSERT INTO market_price_history (security_id,price,source,recorded_at) VALUES (?,?,'fcx_engine',?)", (security_id, quote.new_price, timestamp))
+        if price_changed:
             moved += 1
         if volume > 0:
             db.execute(

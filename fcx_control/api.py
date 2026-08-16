@@ -1824,7 +1824,7 @@ def community_market(principal: dict[str, Any] = Depends(require_community_scope
                ORDER BY s.ticker""",
         )
         settings_rows = all_rows(connection, "SELECT setting_key,setting_value FROM system_settings WHERE setting_key IN ('market_open','buy_enabled','sell_enabled','maintenance_mode')")
-        trade_tape = all_rows(
+        raw_trade_tape = all_rows(
             connection,
             """SELECT t.id,s.ticker,s.name AS security_name,t.buy_volume,t.sell_volume,
                       t.buy_trade_count,t.sell_trade_count,t.reference_price,
@@ -1832,17 +1832,37 @@ def community_market(principal: dict[str, Any] = Depends(require_community_scope
                FROM market_system_trades t
                JOIN market_securities s ON s.id=t.security_id
                WHERE s.active=1 AND s.lifecycle_status='active'
+                 AND (COALESCE(t.buy_volume,0)>0 OR COALESCE(t.sell_volume,0)>0)
                ORDER BY t.id DESC LIMIT 80""",
         )
         history_rows = all_rows(
             connection,
-            """SELECT ticker,price,source,recorded_at FROM (
+            """WITH execution_flow AS (
+                   SELECT security_id,created_at,
+                          SUM(COALESCE(buy_volume,0)) AS buy_volume,
+                          SUM(COALESCE(sell_volume,0)) AS sell_volume,
+                          SUM(COALESCE(buy_trade_count,0)) AS buy_trade_count,
+                          SUM(COALESCE(sell_trade_count,0)) AS sell_trade_count,
+                          SUM((COALESCE(buy_volume,0)+COALESCE(sell_volume,0))*COALESCE(reference_price,0)) AS traded_notional
+                   FROM market_system_trades
+                   WHERE COALESCE(buy_volume,0)>0 OR COALESCE(sell_volume,0)>0
+                   GROUP BY security_id,created_at
+               ), ranked_history AS (
                    SELECT s.ticker,h.price,h.source,h.recorded_at,
+                          COALESCE(f.buy_volume,0) AS buy_volume,
+                          COALESCE(f.sell_volume,0) AS sell_volume,
+                          COALESCE(f.buy_trade_count,0) AS buy_trade_count,
+                          COALESCE(f.sell_trade_count,0) AS sell_trade_count,
+                          COALESCE(f.traded_notional,0) AS traded_notional,
                           ROW_NUMBER() OVER (PARTITION BY h.security_id ORDER BY h.id DESC) AS position
                    FROM market_price_history h
                    JOIN market_securities s ON s.id=h.security_id
+                   LEFT JOIN execution_flow f ON f.security_id=h.security_id AND f.created_at=h.recorded_at
                    WHERE s.active=1 AND s.lifecycle_status='active'
-               ) history WHERE position<=240 ORDER BY ticker,recorded_at""",
+               )
+               SELECT ticker,price,source,recorded_at,buy_volume,sell_volume,
+                      buy_trade_count,sell_trade_count,traded_notional
+               FROM ranked_history WHERE position<=240 ORDER BY ticker,recorded_at""",
         )
         index_funds = all_rows(
             connection,
@@ -1863,8 +1883,27 @@ def community_market(principal: dict[str, Any] = Depends(require_community_scope
                ORDER BY m.fund_id,m.rank,s.ticker""",
         )
     price_history: dict[str, list[dict[str, Any]]] = {}
+    cumulative_volume: dict[str, Decimal] = {}
+    cumulative_notional: dict[str, Decimal] = {}
     for row in history_rows:
-        ticker = str(row.pop("ticker"))
+        ticker = str(row.pop("ticker")).upper()
+        buy_row_volume = Decimal(str(row.pop("buy_volume", 0) or 0))
+        sell_row_volume = Decimal(str(row.pop("sell_volume", 0) or 0))
+        row_volume = buy_row_volume + sell_row_volume
+        row_notional = Decimal(str(row.pop("traded_notional", 0) or 0))
+        trade_count = int(row.pop("buy_trade_count", 0) or 0) + int(row.pop("sell_trade_count", 0) or 0)
+        cumulative_volume[ticker] = cumulative_volume.get(ticker, Decimal("0")) + row_volume
+        cumulative_notional[ticker] = cumulative_notional.get(ticker, Decimal("0")) + row_notional
+        row["volume"] = row_volume
+        row["buy_volume"] = buy_row_volume
+        row["sell_volume"] = sell_row_volume
+        row["trade_count"] = trade_count
+        row["quote_count"] = 1
+        row["bucket_vwap"] = (row_notional / row_volume) if row_volume > 0 else None
+        row["cumulative_vwap"] = (
+            cumulative_notional[ticker] / cumulative_volume[ticker]
+            if cumulative_volume[ticker] > 0 else None
+        )
         price_history.setdefault(ticker, []).append(row)
     members_by_fund: dict[int, list[dict[str, Any]]] = {}
     for row in member_rows:
@@ -1872,8 +1911,33 @@ def community_market(principal: dict[str, Any] = Depends(require_community_scope
         members_by_fund.setdefault(fund_id, []).append(row)
     for fund in index_funds:
         fund["members"] = members_by_fund.get(int(fund["id"]), [])
-    buy_volume = sum((Decimal(str(row.get("buy_volume") or 0)) for row in trade_tape), Decimal("0"))
-    sell_volume = sum((Decimal(str(row.get("sell_volume") or 0)) for row in trade_tape), Decimal("0"))
+    trade_tape: list[dict[str, Any]] = []
+    for raw in raw_trade_tape:
+        source = str(raw.get("source") or "market").lower()
+        flow_type = "ai" if "gemini" in source else "market"
+        for side, volume_key, count_key in (
+            ("buy", "buy_volume", "buy_trade_count"),
+            ("sell", "sell_volume", "sell_trade_count"),
+        ):
+            quantity = Decimal(str(raw.get(volume_key) or 0))
+            if quantity <= 0:
+                continue
+            trade_tape.append({
+                "id": f"{raw['id']}-{side}",
+                "ticker": str(raw.get("ticker") or "FCX").upper(),
+                "security_name": raw.get("security_name") or "",
+                "side": side,
+                "quantity": quantity,
+                "unit_price": raw.get("reference_price") or 0,
+                "trade_count": int(raw.get(count_key) or 0),
+                "flow_type": flow_type,
+                "source": raw.get("source") or "market",
+                "price_change_percent": raw.get("price_change_percent") or 0,
+                "created_at": raw.get("created_at"),
+            })
+    trade_tape = trade_tape[:80]
+    buy_volume = sum((Decimal(str(row.get("buy_volume") or 0)) for row in raw_trade_tape), Decimal("0"))
+    sell_volume = sum((Decimal(str(row.get("sell_volume") or 0)) for row in raw_trade_tape), Decimal("0"))
     return {
         "ok": True,
         "community_id": principal["community_id"],
@@ -1887,7 +1951,7 @@ def community_market(principal: dict[str, Any] = Depends(require_community_scope
         "market_analytics": {
             "recorded_buy_volume": buy_volume,
             "recorded_sell_volume": sell_volume,
-            "recorded_trade_events": len(trade_tape),
+            "recorded_trade_events": sum(int(row.get("trade_count") or 0) for row in trade_tape),
         },
     }
 
