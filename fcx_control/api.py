@@ -1815,7 +1815,8 @@ def community_market(principal: dict[str, Any] = Depends(require_community_scope
         securities = all_rows(
             connection,
             """SELECT s.id,s.ticker,s.name,s.security_type,s.sector,s.description,s.price,
-                      s.previous_price,s.volatility,s.updated_at,
+                      s.previous_price,s.volatility,s.issued_shares,
+                      ROUND(s.price*s.issued_shares,2) AS market_cap,s.updated_at,
                       EXISTS(SELECT 1 FROM market_security_halts h WHERE h.security_id=s.id AND h.status='active') AS halted
                FROM market_securities s
                WHERE s.active=1 AND s.lifecycle_status='active'
