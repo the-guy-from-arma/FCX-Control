@@ -324,6 +324,52 @@ DDL = (
         FOREIGN KEY (assigned_by) REFERENCES fcx_control_admin_users(id) ON DELETE SET NULL,
         FOREIGN KEY (reviewed_by) REFERENCES fcx_control_admin_users(id) ON DELETE SET NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS market_fec_asset_pool (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        balance NUMERIC(24,2) NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS market_fec_asset_ledger (
+        id SERIAL PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        amount NUMERIC(24,2) NOT NULL,
+        pool_delta NUMERIC(24,2) NOT NULL,
+        pool_balance_after NUMERIC(24,2) NOT NULL,
+        market_account_id INTEGER,
+        target_user_id BIGINT,
+        target_name TEXT NOT NULL DEFAULT '',
+        target_account_id TEXT NOT NULL DEFAULT '',
+        target_identity_id TEXT NOT NULL DEFAULT '',
+        case_reference TEXT NOT NULL DEFAULT '',
+        reason TEXT NOT NULL DEFAULT '',
+        allocation_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+        created_by BIGINT,
+        created_by_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (market_account_id) REFERENCES market_accounts(id) ON DELETE SET NULL,
+        FOREIGN KEY (target_user_id) REFERENCES fcx_ravenhood_accounts(id) ON DELETE SET NULL,
+        FOREIGN KEY (created_by) REFERENCES fcx_control_admin_users(id) ON DELETE SET NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS market_fec_equity_cash_resets (
+        id SERIAL PRIMARY KEY,
+        affected_accounts INTEGER NOT NULL DEFAULT 0,
+        removed_amount NUMERIC(24,2) NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL,
+        created_by BIGINT,
+        created_by_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (created_by) REFERENCES fcx_control_admin_users(id) ON DELETE SET NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS market_fec_share_resets (
+        id SERIAL PRIMARY KEY,
+        affected_accounts INTEGER NOT NULL DEFAULT 0,
+        removed_shares NUMERIC(30,8) NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL,
+        created_by BIGINT,
+        created_by_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (created_by) REFERENCES fcx_control_admin_users(id) ON DELETE SET NULL
+    )""",
 )
 
 
@@ -336,4 +382,8 @@ def ensure_base_schema(db: Any) -> None:
     db.execute(
         "ALTER TABLE market_holdings "
         "ADD COLUMN IF NOT EXISTS reserved_quantity NUMERIC(24,8) NOT NULL DEFAULT 0"
+    )
+    db.execute(
+        "INSERT INTO market_fec_asset_pool (id,balance,updated_at) VALUES (1,0,'') "
+        "ON CONFLICT (id) DO NOTHING"
     )

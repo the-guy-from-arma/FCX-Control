@@ -5,12 +5,34 @@ import os
 import secrets
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from fcx_engine.service import (
+    CycleRequest as EngineCycleRequest,
+    DividendRequest as EngineDividendRequest,
+    EngineSettingsRequest,
+    KillSwitchRequest as EngineKillSwitchRequest,
+    SandboxRequest as EngineSandboxRequest,
+    SeedRequest as EngineSeedRequest,
+    StockSplitRequest as EngineStockSplitRequest,
+    admin_cycle as run_engine_cycle,
+    admin_dividend as run_engine_dividend,
+    admin_kill_switch as set_engine_kill_switch,
+    admin_market_pause as pause_engine_market,
+    admin_market_resume as resume_engine_market,
+    admin_market_snapshot as engine_market_snapshot,
+    admin_sandbox as run_engine_sandbox,
+    admin_seed as seed_engine_population,
+    admin_settings as update_engine_configuration,
+    admin_stock_split as run_engine_stock_split,
+    admin_ticker_pause as pause_engine_ticker,
+    admin_ticker_resume as resume_engine_ticker,
+)
 
 from .config import settings
 from .db import all_rows, execute, one, transaction
@@ -168,6 +190,106 @@ class MarketSettingsPatch(BaseModel):
     maintenance_mode: bool | None = None
     leverage_enabled: bool | None = None
     max_leverage: Decimal | None = Field(default=None, ge=1, le=200)
+    manual_override: Literal["schedule", "open", "closed"] | None = None
+    schedule_open_time: str | None = Field(default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    schedule_close_time: str | None = Field(default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    schedule_timezone: str | None = Field(default=None, min_length=3, max_length=80)
+    weekends_enabled: bool | None = None
+    fcxv_24h_enabled: bool | None = None
+    transfer_fee_percent: Decimal | None = Field(default=None, ge=0, le=25)
+    trade_fee_percent: Decimal | None = Field(default=None, ge=0, le=10)
+    margin_enabled: bool | None = None
+    margin_maintenance_percent: Decimal | None = Field(default=None, ge=5, le=80)
+    margin_max_open_positions: int | None = Field(default=None, ge=1, le=25)
+    margin_max_account_notional: Decimal | None = Field(default=None, ge=100, le=1_000_000_000)
+    liquidation_hunts_enabled: bool | None = None
+    liquidation_hunt_threshold: Decimal | None = Field(default=None, ge=0, le=1_000_000_000_000_000)
+    liquidation_hunt_probability_percent: Decimal | None = Field(default=None, ge=0, le=100)
+    liquidation_hunt_intensity: Literal["light", "balanced", "aggressive", "extreme"] | None = None
+    liquidation_hunt_max_move_percent: Decimal | None = Field(default=None, ge=0.01, le=1000)
+    liquidation_hunt_cooldown_minutes: int | None = Field(default=None, ge=1, le=10080)
+    liquidation_hunt_market_hours_only: bool | None = None
+
+
+class PriceProgramRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    security_ids: list[int] = Field(min_length=1, max_length=100)
+    event_name: str = Field(min_length=3, max_length=500)
+    percent_change: Decimal = Field(ge=-99.99, le=1000, max_digits=12, decimal_places=4)
+    duration_minutes: int = Field(ge=1, le=43200)
+    starts_at: datetime | None = None
+
+
+class ProgramStopRequest(BaseModel):
+    keep_current_price: bool = True
+
+
+class SecurityHaltRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    security_ids: list[int] = Field(min_length=1, max_length=100)
+    reason_code: str = Field(default="FEC_REVIEW", min_length=2, max_length=120)
+    reason_label: str = Field(default="FEC market-integrity review", min_length=3, max_length=300)
+    public_notice: str = Field(default="Trading temporarily halted by the FEC.", max_length=2000)
+    case_reference: str = Field(default="", max_length=200)
+    automatic_resume_at: datetime | None = None
+
+
+class SecurityDelistRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    security_id: int = Field(ge=1)
+    reason_code: str = Field(default="FEC_ORDER", min_length=2, max_length=120)
+    reason_label: str = Field(default="FEC listing order", min_length=3, max_length=300)
+    public_notice: str = Field(default="Security removed from public FCX trading by FEC order.", max_length=2000)
+    case_reference: str = Field(default="", max_length=200)
+
+
+class ReleaseRequest(BaseModel):
+    note: str = Field(default="Released by authorized FEC operator", max_length=2000)
+
+
+class AccountRestrictionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    account_id: int = Field(ge=1)
+    scope: Literal["full", "equity", "leverage"]
+    reason: str = Field(min_length=3, max_length=2000)
+    case_reference: str = Field(default="", max_length=200)
+
+
+class AssetSeizureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    account_id: int = Field(ge=1)
+    amount: Decimal = Field(gt=0, le=50_000_000_000, max_digits=24, decimal_places=2)
+    case_reference: str = Field(min_length=3, max_length=200)
+    reason: str = Field(min_length=10, max_length=4000)
+    authorization: str = Field(pattern=r"^SEIZE$")
+
+
+class AssetDispositionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    disposition: Literal["forfeit", "reinvest", "return"]
+    amount: Decimal = Field(gt=0, le=50_000_000_000, max_digits=24, decimal_places=2)
+    target_account_id: int | None = Field(default=None, ge=1)
+    case_reference: str = Field(min_length=3, max_length=200)
+    reason: str = Field(min_length=10, max_length=4000)
+    authorization: str = Field(pattern=r"^FORECLOSE$")
+
+
+class IpoReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    decision: Literal["approved", "rejected", "needs_changes"]
+    note: str = Field(min_length=3, max_length=4000)
+
+
+class DestructiveResetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(min_length=10, max_length=4000)
+    confirmation: Literal["WIPE FCX EQUITY", "WIPE FCX SHARES"]
+
+
+class SecurityMarginPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    margin_enabled: bool | None = None
+    margin_max_leverage: Decimal | None = Field(default=None, ge=1, le=200)
 
 
 @router.get("/health")
@@ -365,7 +487,7 @@ def accounts(limit: int = 200, _: dict[str, Any] = Depends(require_roles(*ADMIN_
 
 
 @router.get("/admin/investigations")
-def investigations(limit: int = 200, _: dict[str, Any] = Depends(require_roles("developer"))) -> dict[str, Any]:
+def investigations(limit: int = 200, _: dict[str, Any] = Depends(require_roles("developer", "fec_admin"))) -> dict[str, Any]:
     safe_limit = min(max(limit, 1), 1000)
     with transaction() as connection:
         rows = all_rows(
@@ -383,7 +505,7 @@ def investigations(limit: int = 200, _: dict[str, Any] = Depends(require_roles("
 
 
 @router.patch("/admin/investigations/{case_id}")
-def update_investigation(case_id: int, payload: InvestigationPatch, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
+def update_investigation(case_id: int, payload: InvestigationPatch, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
     changes = payload.model_dump(exclude_none=True)
     if not changes:
         raise HTTPException(status_code=400, detail="No investigation changes supplied")
@@ -423,15 +545,655 @@ def update_market_settings(payload: MarketSettingsPatch, request: Request, user:
     changes = payload.model_dump(exclude_none=True)
     if not changes:
         raise HTTPException(status_code=400, detail="No market settings supplied")
+    key_map = {
+        "manual_override": "market_manual_override",
+        "schedule_open_time": "market_schedule_open_time",
+        "schedule_close_time": "market_schedule_close_time",
+        "schedule_timezone": "market_schedule_timezone",
+        "weekends_enabled": "market_weekends_enabled",
+        "fcxv_24h_enabled": "market_fcxv_24h_enabled",
+        "transfer_fee_percent": "market_transfer_fee_percent",
+        "trade_fee_percent": "market_trade_fee_percent",
+        "margin_enabled": "market_margin_enabled",
+        "margin_maintenance_percent": "market_margin_maintenance_percent",
+        "margin_max_open_positions": "market_margin_max_open_positions",
+        "margin_max_account_notional": "market_margin_max_account_notional",
+        "liquidation_hunts_enabled": "market_liquidation_hunts_enabled",
+        "liquidation_hunt_threshold": "market_liquidation_hunt_threshold",
+        "liquidation_hunt_probability_percent": "market_liquidation_hunt_probability_percent",
+        "liquidation_hunt_intensity": "market_liquidation_hunt_intensity",
+        "liquidation_hunt_max_move_percent": "market_liquidation_hunt_max_move_percent",
+        "liquidation_hunt_cooldown_minutes": "market_liquidation_hunt_cooldown_minutes",
+        "liquidation_hunt_market_hours_only": "market_liquidation_hunt_market_hours_only",
+    }
+    stored_changes = {key_map.get(key, key): value for key, value in changes.items()}
     with transaction() as connection:
         previous_rows = all_rows(connection, "SELECT setting_key,setting_value FROM system_settings")
-        previous = {row["setting_key"]: row["setting_value"] for row in previous_rows if row["setting_key"] in changes}
-        for key, value in changes.items():
+        previous = {row["setting_key"]: row["setting_value"] for row in previous_rows if row["setting_key"] in stored_changes}
+        for key, value in stored_changes.items():
             stored = "1" if value is True else "0" if value is False else str(value)
             execute(connection, """INSERT INTO system_settings(setting_key,setting_value,updated_at) VALUES (:key,:value,NOW())
                 ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at""", {"key": key, "value": stored})
-        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="market.settings.updated", target_type="market", previous=previous, new=changes, request=request)
-    return {"ok": True, "settings": changes}
+        if changes.get("manual_override") in {"open", "closed"}:
+            forced_open = changes["manual_override"] == "open"
+            execute(connection, """INSERT INTO system_settings(setting_key,setting_value,updated_at) VALUES ('market_open',:value,NOW())
+                ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at""", {"value": "1" if forced_open else "0"})
+            stored_changes["market_open"] = forced_open
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="market.settings.updated", target_type="market", previous=previous, new=stored_changes, request=request)
+    return {"ok": True, "settings": stored_changes}
+
+
+@router.get("/admin/engine/snapshot")
+def engine_snapshot(_: dict[str, Any] = Depends(require_roles("developer"))) -> dict[str, Any]:
+    """Expose the FCX-owned engine only through the authenticated FEC session."""
+    return engine_market_snapshot()
+
+
+@router.patch("/admin/engine/settings")
+def engine_settings(
+    payload: EngineSettingsRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf("developer")),
+) -> dict[str, Any]:
+    result = update_engine_configuration(payload)
+    with transaction() as connection:
+        audit(
+            connection,
+            actor_type="admin",
+            actor_id=str(user["id"]),
+            actor_role=",".join(user["roles"]),
+            action="engine.settings.updated",
+            target_type="fcx_engine",
+            new=payload.model_dump(exclude_none=True),
+            request=request,
+        )
+    return result
+
+
+@router.post("/admin/engine/cycle")
+def engine_cycle(
+    payload: EngineCycleRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf("developer")),
+) -> dict[str, Any]:
+    result = run_engine_cycle(payload)
+    with transaction() as connection:
+        audit(
+            connection,
+            actor_type="admin",
+            actor_id=str(user["id"]),
+            actor_role=",".join(user["roles"]),
+            action="engine.cycle.manual",
+            target_type="fcx_engine",
+            target_id=payload.cycle,
+            new=result.get("result", {}),
+            request=request,
+        )
+    return result
+
+
+@router.post("/admin/engine/seed")
+def engine_seed(
+    payload: EngineSeedRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf("developer")),
+) -> dict[str, Any]:
+    result = seed_engine_population(payload)
+    with transaction() as connection:
+        audit(
+            connection,
+            actor_type="admin",
+            actor_id=str(user["id"]),
+            actor_role=",".join(user["roles"]),
+            action="engine.population.seeded",
+            target_type="fcx_engine",
+            new=result.get("result", {}),
+            request=request,
+        )
+    return result
+
+
+@router.post("/admin/engine/pause")
+def engine_pause(
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf("developer")),
+) -> dict[str, Any]:
+    result = pause_engine_market()
+    with transaction() as connection:
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="engine.paused", target_type="fcx_engine", request=request)
+    return result
+
+
+@router.post("/admin/engine/resume")
+def engine_resume(
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf("developer")),
+) -> dict[str, Any]:
+    result = resume_engine_market()
+    with transaction() as connection:
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="engine.resumed", target_type="fcx_engine", request=request)
+    return result
+
+
+@router.post("/admin/engine/sandbox")
+def engine_sandbox(
+    payload: EngineSandboxRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf("developer")),
+) -> dict[str, Any]:
+    result = run_engine_sandbox(payload)
+    with transaction() as connection:
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="engine.sandbox.completed", target_type="fcx_engine", new={"days": payload.days, "seed": payload.seed}, request=request)
+    return result
+
+
+@router.post("/admin/engine/kill-switch")
+def engine_kill_switch(
+    payload: EngineKillSwitchRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf("developer")),
+) -> dict[str, Any]:
+    result = set_engine_kill_switch(payload)
+    with transaction() as connection:
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="engine.kill_switch.updated", target_type="fcx_engine", new={"active": payload.active}, request=request)
+    return result
+
+
+@router.post("/admin/engine/ticker/{ticker}/pause")
+def engine_ticker_pause(ticker: str, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
+    result = pause_engine_ticker(ticker)
+    with transaction() as connection:
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="engine.ticker.paused", target_type="security", target_id=ticker.upper(), request=request)
+    return result
+
+
+@router.post("/admin/engine/ticker/{ticker}/resume")
+def engine_ticker_resume(ticker: str, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
+    result = resume_engine_ticker(ticker)
+    with transaction() as connection:
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="engine.ticker.resumed", target_type="security", target_id=ticker.upper(), request=request)
+    return result
+
+
+@router.post("/admin/engine/corporate-actions/split")
+def engine_stock_split(payload: EngineStockSplitRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
+    result = run_engine_stock_split(payload)
+    with transaction() as connection:
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="engine.stock_split.applied", target_type="security", target_id=payload.ticker.upper(), new=payload.model_dump(), request=request)
+    return result
+
+
+@router.post("/admin/engine/corporate-actions/dividend")
+def engine_dividend(payload: EngineDividendRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
+    result = run_engine_dividend(payload)
+    with transaction() as connection:
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="engine.dividend.declared", target_type="security", target_id=payload.ticker.upper(), new=payload.model_dump(), request=request)
+    return result
+
+
+@router.get("/admin/operations")
+def market_operations(_: dict[str, Any] = Depends(require_roles("developer", "commissioner", "fcx_admin", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        securities = all_rows(connection, """SELECT s.*,
+            EXISTS(SELECT 1 FROM market_security_halts h WHERE h.security_id=s.id AND h.status='active') AS halted,
+            EXISTS(SELECT 1 FROM market_security_delistings d WHERE d.security_id=s.id AND d.status='active') AS delisted
+            FROM market_securities s ORDER BY s.active DESC,s.ticker""")
+        programs = all_rows(connection, """SELECT p.*,s.ticker,s.name FROM market_price_programs p
+            LEFT JOIN market_securities s ON s.id=p.security_id ORDER BY p.id DESC LIMIT 500""")
+        halts = all_rows(connection, """SELECT h.*,s.ticker,s.name FROM market_security_halts h
+            JOIN market_securities s ON s.id=h.security_id ORDER BY h.id DESC LIMIT 500""")
+        delistings = all_rows(connection, """SELECT d.*,s.ticker,s.name FROM market_security_delistings d
+            JOIN market_securities s ON s.id=d.security_id ORDER BY d.id DESC LIMIT 500""")
+        funds = all_rows(connection, """SELECT f.*,s.ticker,s.price,
+            COUNT(m.security_id) AS constituent_count FROM market_index_funds f
+            JOIN market_securities s ON s.id=f.security_id
+            LEFT JOIN market_index_members m ON m.fund_id=f.id
+            GROUP BY f.id,s.id ORDER BY f.fund_key""")
+    return {"ok": True, "securities": securities, "programs": programs, "halts": halts, "delistings": delistings, "funds": funds}
+
+
+@router.post("/admin/operations/programs")
+def create_price_program(payload: PriceProgramRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
+    starts_at = payload.starts_at or utcnow()
+    if starts_at.tzinfo is None:
+        starts_at = starts_at.replace(tzinfo=timezone.utc)
+    ends_at = starts_at + timedelta(minutes=payload.duration_minutes)
+    created: list[dict[str, Any]] = []
+    with transaction() as connection:
+        securities = all_rows(connection, "SELECT id,ticker,name,price FROM market_securities WHERE id=ANY(CAST(:ids AS int[])) ORDER BY ticker", {"ids": payload.security_ids})
+        if len(securities) != len(set(payload.security_ids)):
+            raise HTTPException(status_code=404, detail="One or more selected FCX securities were not found")
+        for security in securities:
+            start_price = Decimal(str(security["price"]))
+            target_price = (start_price * (Decimal("1") + payload.percent_change / Decimal("100"))).quantize(Decimal("0.0001"))
+            status = "scheduled" if starts_at > utcnow() else "active"
+            row = one(connection, """INSERT INTO market_price_programs
+                (security_id,event_name,percent_change,duration_minutes,start_price,target_price,starts_at,ends_at,status,created_by,created_at)
+                VALUES (:security,:event,:change,:duration,:start,:target,:starts,:ends,:status,:user,:now)
+                RETURNING id""", {"security": security["id"], "event": payload.event_name, "change": payload.percent_change,
+                "duration": payload.duration_minutes, "start": start_price, "target": target_price,
+                "starts": starts_at.isoformat(), "ends": ends_at.isoformat(), "status": status, "user": user["id"], "now": utcnow().isoformat()})
+            created.append({"id": row["id"], "ticker": security["ticker"], "start_price": start_price, "target_price": target_price, "status": status})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="market.program.created", target_type="security_group", target_id=",".join(str(item) for item in payload.security_ids), new={**payload.model_dump(), "created": created}, request=request)
+    return {"ok": True, "programs": created}
+
+
+@router.post("/admin/operations/programs/{program_id}/stop")
+def stop_price_program(program_id: int, payload: ProgramStopRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
+    with transaction() as connection:
+        program = one(connection, """SELECT p.*,s.ticker,s.price AS current_price FROM market_price_programs p
+            LEFT JOIN market_securities s ON s.id=p.security_id WHERE p.id=:id""", {"id": program_id})
+        if not program:
+            raise HTTPException(status_code=404, detail="Price program not found")
+        execute(connection, "UPDATE market_price_programs SET status='stopped',ends_at=:now WHERE id=:id", {"id": program_id, "now": utcnow().isoformat()})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="market.program.stopped", target_type="price_program", target_id=str(program_id), previous=program, new={"keep_current_price": payload.keep_current_price, "current_price": program.get("current_price")}, request=request)
+    return {"ok": True, "kept_price": program.get("current_price")}
+
+
+@router.post("/admin/operations/halts")
+def halt_securities(payload: SecurityHaltRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    created: list[int] = []
+    with transaction() as connection:
+        securities = all_rows(connection, "SELECT id,ticker FROM market_securities WHERE id=ANY(CAST(:ids AS int[]))", {"ids": payload.security_ids})
+        if len(securities) != len(set(payload.security_ids)):
+            raise HTTPException(status_code=404, detail="One or more selected FCX securities were not found")
+        for security in securities:
+            existing = one(connection, "SELECT id FROM market_security_halts WHERE security_id=:security AND status='active'", {"security": security["id"]})
+            if existing:
+                continue
+            row = one(connection, """INSERT INTO market_security_halts
+                (security_id,status,reason_code,reason_label,public_notice,case_reference,halted_by,halted_by_name,halted_at,automatic_resume_at,engine_managed)
+                VALUES (:security,'active',:code,:label,:notice,:case,:user,:name,:now,:resume,0) RETURNING id""",
+                {"security": security["id"], "code": payload.reason_code, "label": payload.reason_label,
+                 "notice": payload.public_notice, "case": payload.case_reference, "user": user["id"], "name": user["display_name"],
+                 "now": utcnow().isoformat(), "resume": payload.automatic_resume_at.isoformat() if payload.automatic_resume_at else None})
+            created.append(row["id"])
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.security.halted", target_type="security_group", target_id=",".join(str(item) for item in payload.security_ids), new=payload.model_dump(), request=request)
+    return {"ok": True, "created": created}
+
+
+@router.post("/admin/operations/halts/{halt_id}/resume")
+def resume_halt(halt_id: int, payload: ReleaseRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        existing = one(connection, "SELECT * FROM market_security_halts WHERE id=:id AND status='active'", {"id": halt_id})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Active halt not found")
+        execute(connection, """UPDATE market_security_halts SET status='released',resumed_by=:user,resumed_by_name=:name,
+            resumed_at=:now,resume_note=:note WHERE id=:id""", {"id": halt_id, "user": user["id"], "name": user["display_name"], "now": utcnow().isoformat(), "note": payload.note})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.security.resumed", target_type="security_halt", target_id=str(halt_id), previous=existing, new={"note": payload.note}, request=request)
+    return {"ok": True}
+
+
+@router.post("/admin/operations/halts/resume-all")
+def resume_all_halts(payload: ReleaseRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        active = all_rows(connection, "SELECT id FROM market_security_halts WHERE status='active'")
+        execute(connection, """UPDATE market_security_halts SET status='released',resumed_by=:user,resumed_by_name=:name,
+            resumed_at=:now,resume_note=:note WHERE status='active'""", {"user": user["id"], "name": user["display_name"], "now": utcnow().isoformat(), "note": payload.note})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.security.resumed_all", target_type="security_halt", new={"count": len(active), "note": payload.note}, request=request)
+    return {"ok": True, "released": len(active)}
+
+
+@router.post("/admin/operations/delistings")
+def delist_security(payload: SecurityDelistRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        security = one(connection, "SELECT * FROM market_securities WHERE id=:id", {"id": payload.security_id})
+        if not security:
+            raise HTTPException(status_code=404, detail="FCX security not found")
+        if one(connection, "SELECT id FROM market_security_delistings WHERE security_id=:id AND status='active'", {"id": payload.security_id}):
+            raise HTTPException(status_code=409, detail="Security is already delisted")
+        row = one(connection, """INSERT INTO market_security_delistings
+            (security_id,status,reason_code,reason_label,public_notice,case_reference,delisted_by,delisted_by_name,delisted_at)
+            VALUES (:security,'active',:code,:label,:notice,:case,:user,:name,:now) RETURNING id""",
+            {"security": payload.security_id, "code": payload.reason_code, "label": payload.reason_label, "notice": payload.public_notice,
+             "case": payload.case_reference, "user": user["id"], "name": user["display_name"], "now": utcnow().isoformat()})
+        execute(connection, "UPDATE market_securities SET active=0,lifecycle_status='delisted',updated_at=:now WHERE id=:id", {"id": payload.security_id, "now": utcnow().isoformat()})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.security.delisted", target_type="security", target_id=str(payload.security_id), previous=security, new=payload.model_dump(), request=request)
+    return {"ok": True, "delisting_id": row["id"]}
+
+
+@router.post("/admin/operations/delistings/{delisting_id}/relist")
+def relist_security(delisting_id: int, payload: ReleaseRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        existing = one(connection, "SELECT * FROM market_security_delistings WHERE id=:id AND status='active'", {"id": delisting_id})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Active delisting not found")
+        execute(connection, """UPDATE market_security_delistings SET status='released',relisted_by=:user,relisted_by_name=:name,
+            relisted_at=:now,relist_note=:note WHERE id=:id""", {"id": delisting_id, "user": user["id"], "name": user["display_name"], "now": utcnow().isoformat(), "note": payload.note})
+        execute(connection, "UPDATE market_securities SET active=1,lifecycle_status='active',updated_at=:now WHERE id=:id", {"id": existing["security_id"], "now": utcnow().isoformat()})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.security.relisted", target_type="security", target_id=str(existing["security_id"]), previous=existing, new={"note": payload.note}, request=request)
+    return {"ok": True}
+
+
+@router.get("/admin/leverage")
+def leverage_workspace(_: dict[str, Any] = Depends(require_roles("developer", "commissioner", "fcx_admin", "fec_admin"))) -> dict[str, Any]:
+    identity_select = """r.account_id AS ravenhood_account_id,r.display_name,r.status AS resident_status,
+        COALESCE(MAX(NULLIF(l.bohemia_identity_id,'')),'') AS bohemia_identity_id,
+        COALESCE(STRING_AGG(DISTINCT l.community_id, ', '),'') AS communities"""
+    with transaction() as connection:
+        settings_rows = all_rows(connection, "SELECT setting_key,setting_value,updated_at FROM system_settings WHERE setting_key LIKE '%leverage%' OR setting_key LIKE '%margin%' ORDER BY setting_key")
+        securities = all_rows(connection, "SELECT id,ticker,name,price,margin_enabled,margin_max_leverage,active,lifecycle_status FROM market_securities ORDER BY ticker")
+        open_positions = all_rows(connection, f"""SELECT p.*,s.ticker,s.name,s.price AS mark_price,a.cash_balance,
+            {identity_select},
+            COALESCE(MAX(ar.scope) FILTER (WHERE ar.status='active'),'') AS restriction_scope
+            FROM market_margin_positions p JOIN market_securities s ON s.id=p.security_id
+            JOIN market_accounts a ON a.id=p.account_id JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+            LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+            LEFT JOIN market_account_trading_restrictions ar ON ar.account_id=a.id
+            WHERE p.status='open' GROUP BY p.id,s.id,a.id,r.id ORDER BY p.opened_at DESC LIMIT 1000""")
+        closed_positions = all_rows(connection, f"""SELECT p.*,s.ticker,s.name,a.cash_balance,
+            {identity_select} FROM market_margin_positions p JOIN market_securities s ON s.id=p.security_id
+            JOIN market_accounts a ON a.id=p.account_id JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+            LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+            WHERE p.status<>'open' GROUP BY p.id,s.id,a.id,r.id ORDER BY p.closed_at DESC NULLS LAST,p.id DESC LIMIT 1000""")
+        requests = all_rows(connection, f"""SELECT q.*,s.ticker,s.name,a.cash_balance,
+            {identity_select} FROM market_margin_order_requests q JOIN market_securities s ON s.id=q.security_id
+            JOIN market_accounts a ON a.id=q.account_id JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+            LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+            GROUP BY q.id,s.id,a.id,r.id ORDER BY q.id DESC LIMIT 1000""")
+        stats = one(connection, """SELECT
+            COUNT(*) FILTER (WHERE status='open') AS open_positions,
+            COALESCE(SUM(collateral) FILTER (WHERE status='open'),0) AS locked_collateral,
+            COALESCE(SUM(entry_notional) FILTER (WHERE status='open'),0) AS open_exposure,
+            COALESCE(SUM(realized_pnl) FILTER (WHERE status<>'open'),0) AS realized_pnl,
+            COUNT(*) FILTER (WHERE status<>'open') AS closed_positions
+            FROM market_margin_positions""") or {}
+    return {"ok": True, "settings": settings_rows, "securities": securities, "open_positions": open_positions, "closed_positions": closed_positions, "requests": requests, "stats": stats}
+
+
+@router.patch("/admin/leverage/securities/{security_id}")
+def update_security_margin(
+    security_id: int,
+    payload: SecurityMarginPatch,
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf("developer")),
+) -> dict[str, Any]:
+    changes = payload.model_dump(exclude_none=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="No security leverage settings supplied")
+    assignments = ",".join(f"{key}=:{key}" for key in changes)
+    with transaction() as connection:
+        previous = one(connection, "SELECT id,ticker,name,margin_enabled,margin_max_leverage FROM market_securities WHERE id=:id", {"id": security_id})
+        if not previous:
+            raise HTTPException(status_code=404, detail="FCX security not found")
+        execute(connection, f"UPDATE market_securities SET {assignments},updated_at=:updated WHERE id=:id", {**changes, "updated": utcnow().isoformat(), "id": security_id})
+        current = one(connection, "SELECT id,ticker,name,margin_enabled,margin_max_leverage FROM market_securities WHERE id=:id", {"id": security_id})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="leverage.security.updated", target_type="security", target_id=str(security_id), previous=previous, new=current, request=request)
+    return {"ok": True, "security": current}
+
+
+@router.get("/admin/fec/workspace")
+def fec_workspace(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        accounts = all_rows(connection, """SELECT r.id,r.account_id,r.display_name,r.status,r.restriction_reason,
+            a.id AS market_account_id,a.cash_balance,a.status AS trading_status,
+            COALESCE(SUM(h.quantity*s.price),0) AS holdings_value,
+            COALESCE(MAX(NULLIF(l.bohemia_identity_id,'')),'') AS bohemia_identity_id,
+            COALESCE(STRING_AGG(DISTINCT l.community_id, ', '),'') AS communities,
+            COALESCE(MAX(ar.scope) FILTER (WHERE ar.status='active'),'') AS restriction_scope,
+            COALESCE(MAX(ar.reason) FILTER (WHERE ar.status='active'),'') AS restriction_reason,
+            COALESCE(MAX(ar.case_reference) FILTER (WHERE ar.status='active'),'') AS restriction_case
+            FROM fcx_ravenhood_accounts r LEFT JOIN market_accounts a ON a.user_id=r.id
+            LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+            LEFT JOIN market_holdings h ON h.account_id=a.id LEFT JOIN market_securities s ON s.id=h.security_id
+            LEFT JOIN market_account_trading_restrictions ar ON ar.account_id=a.id
+            GROUP BY r.id,a.id ORDER BY (a.cash_balance+COALESCE(SUM(h.quantity*s.price),0)) DESC NULLS LAST LIMIT 1000""")
+        investigations_rows = all_rows(connection, """SELECT i.*,r.display_name,
+            COALESCE(MAX(NULLIF(l.bohemia_identity_id,'')),'') AS bohemia_identity_id,
+            COALESCE(STRING_AGG(DISTINCT l.community_id, ', '),'') AS communities
+            FROM fcx_investigations i JOIN fcx_ravenhood_accounts r ON r.account_id=i.account_id
+            LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+            GROUP BY i.id,r.id ORDER BY i.updated_at DESC LIMIT 1000""")
+        restrictions = all_rows(connection, """SELECT ar.*,r.account_id AS ravenhood_account_id,r.display_name,
+            COALESCE(MAX(NULLIF(l.bohemia_identity_id,'')),'') AS bohemia_identity_id
+            FROM market_account_trading_restrictions ar JOIN market_accounts a ON a.id=ar.account_id
+            JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+            LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+            GROUP BY ar.id,r.id ORDER BY ar.id DESC LIMIT 1000""")
+        executions = all_rows(connection, """SELECT o.id,o.side,o.quantity,o.unit_price,o.gross_amount,o.fee_amount,o.created_at,
+            s.ticker,s.name,r.account_id AS ravenhood_account_id,r.display_name,
+            COALESCE(MAX(NULLIF(l.bohemia_identity_id,'')),'') AS bohemia_identity_id
+            FROM market_orders o JOIN market_securities s ON s.id=o.security_id
+            JOIN market_accounts a ON a.id=o.account_id JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+            LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+            GROUP BY o.id,s.id,r.id ORDER BY o.id DESC LIMIT 2000""")
+        system_trades = all_rows(connection, """SELECT t.*,s.ticker,s.name FROM market_system_trades t
+            JOIN market_securities s ON s.id=t.security_id ORDER BY t.id DESC LIMIT 1000""")
+        settlements = all_rows(connection, "SELECT * FROM fcx_settlements ORDER BY id DESC LIMIT 1000")
+        issuers = all_rows(connection, """SELECT c.*,s.price,s.active,s.lifecycle_status,
+            COALESCE(s.price*s.issued_shares,0) AS current_market_cap FROM business_issuer_companies c
+            LEFT JOIN market_securities s ON s.id=c.security_id ORDER BY c.id DESC LIMIT 500""")
+        halts = all_rows(connection, """SELECT h.*,s.ticker,s.name FROM market_security_halts h JOIN market_securities s ON s.id=h.security_id
+            WHERE h.status='active' ORDER BY h.id DESC""")
+        delistings = all_rows(connection, """SELECT d.*,s.ticker,s.name FROM market_security_delistings d JOIN market_securities s ON s.id=d.security_id
+            ORDER BY d.id DESC LIMIT 500""")
+        holdings = all_rows(connection, """SELECT h.id,h.account_id,h.quantity,h.reserved_quantity,h.average_cost,
+            s.ticker,s.name,s.price,(h.quantity*s.price) AS market_value,
+            ((s.price-h.average_cost)*h.quantity) AS unrealized_pnl,
+            r.account_id AS ravenhood_account_id,r.display_name,
+            COALESCE(MAX(NULLIF(l.bohemia_identity_id,'')),'') AS bohemia_identity_id
+            FROM market_holdings h JOIN market_securities s ON s.id=h.security_id
+            JOIN market_accounts a ON a.id=h.account_id JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+            LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+            WHERE h.quantity<>0 GROUP BY h.id,s.id,r.id ORDER BY ABS(h.quantity*s.price) DESC LIMIT 5000""")
+        pnl_windows: dict[str, Any] = {}
+        for label, hours in (("12h", 12), ("1d", 24), ("1w", 168)):
+            cutoff = (utcnow() - timedelta(hours=hours)).isoformat()
+            summary = one(connection, """SELECT
+                COALESCE((SELECT SUM(realized_pnl) FROM market_margin_positions WHERE status<>'open' AND closed_at>=:cutoff),0) AS realized,
+                COALESCE((SELECT SUM(CASE WHEN p.direction='long' THEN (s.price-p.entry_price)*p.quantity
+                    ELSE (p.entry_price-s.price)*p.quantity END) FROM market_margin_positions p
+                    JOIN market_securities s ON s.id=p.security_id WHERE p.status='open'),0) AS margin_unrealized,
+                COALESCE((SELECT SUM((s.price-h.average_cost)*h.quantity) FROM market_holdings h
+                    JOIN market_securities s ON s.id=h.security_id),0) AS equity_unrealized,
+                COALESCE((SELECT SUM(cash_balance) FROM market_accounts),0) AS cash_equity,
+                (SELECT COUNT(*) FROM market_orders WHERE created_at>=:cutoff) AS executions,
+                COALESCE((SELECT SUM(gross_amount) FROM market_orders WHERE created_at>=:cutoff),0) AS turnover,
+                COALESCE((SELECT SUM(fee_amount) FROM market_orders WHERE created_at>=:cutoff),0) AS fees""", {"cutoff": cutoff}) or {}
+            leaders = all_rows(connection, """SELECT r.account_id,r.display_name,
+                COALESCE(MAX(NULLIF(l.bohemia_identity_id,'')),'') AS bohemia_identity_id,
+                COALESCE((SELECT SUM(p.realized_pnl) FROM market_margin_positions p WHERE p.account_id=a.id
+                    AND p.status<>'open' AND p.closed_at>=:cutoff),0) AS realized,
+                COALESCE((SELECT SUM(CASE WHEN p.direction='long' THEN (s.price-p.entry_price)*p.quantity
+                    ELSE (p.entry_price-s.price)*p.quantity END) FROM market_margin_positions p
+                    JOIN market_securities s ON s.id=p.security_id WHERE p.account_id=a.id AND p.status='open'),0) AS margin_unrealized,
+                COALESCE((SELECT SUM((s.price-h.average_cost)*h.quantity) FROM market_holdings h
+                    JOIN market_securities s ON s.id=h.security_id WHERE h.account_id=a.id),0) AS equity_unrealized
+                FROM market_accounts a JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+                LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+                GROUP BY a.id,r.id ORDER BY (
+                    COALESCE((SELECT SUM(p.realized_pnl) FROM market_margin_positions p WHERE p.account_id=a.id AND p.status<>'open' AND p.closed_at>=:cutoff),0)
+                    + COALESCE((SELECT SUM(CASE WHEN p.direction='long' THEN (s.price-p.entry_price)*p.quantity ELSE (p.entry_price-s.price)*p.quantity END)
+                        FROM market_margin_positions p JOIN market_securities s ON s.id=p.security_id WHERE p.account_id=a.id AND p.status='open'),0)
+                    + COALESCE((SELECT SUM((s.price-h.average_cost)*h.quantity) FROM market_holdings h JOIN market_securities s ON s.id=h.security_id WHERE h.account_id=a.id),0)
+                ) DESC LIMIT 100""", {"cutoff": cutoff})
+            summary["realized_margin"] = summary.get("realized", 0)
+            summary["unrealized_margin"] = summary.get("margin_unrealized", 0)
+            summary["net_pnl"] = sum((Decimal(str(summary.get(key, 0) or 0)) for key in ("realized", "margin_unrealized", "equity_unrealized")), Decimal("0"))
+            for leader in leaders:
+                leader["net_pnl"] = sum((Decimal(str(leader.get(key, 0) or 0)) for key in ("realized", "margin_unrealized", "equity_unrealized")), Decimal("0"))
+            pnl_windows[label] = {"summary": summary, "leaders": leaders}
+        pool = one(connection, "SELECT balance,updated_at FROM market_fec_asset_pool WHERE id=1") or {"balance": 0, "updated_at": ""}
+        asset_ledger = all_rows(connection, "SELECT * FROM market_fec_asset_ledger ORDER BY id DESC LIMIT 1000")
+        equity_resets = all_rows(connection, "SELECT * FROM market_fec_equity_cash_resets ORDER BY id DESC LIMIT 100")
+        share_resets = all_rows(connection, "SELECT * FROM market_fec_share_resets ORDER BY id DESC LIMIT 100")
+        ipo_reviews = all_rows(connection, """SELECT c.*,s.price,s.active,s.lifecycle_status,
+            COALESCE(s.price*s.issued_shares,0) AS current_market_cap,
+            COALESCE(r.display_name,'') AS owner_name,r.account_id AS owner_account_id,
+            COALESCE(MAX(NULLIF(l.bohemia_identity_id,'')),'') AS bohemia_identity_id
+            FROM business_issuer_companies c LEFT JOIN market_securities s ON s.id=c.security_id
+            LEFT JOIN fcx_ravenhood_accounts r ON r.id=c.controlling_user_id
+            LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+            GROUP BY c.id,s.id,r.id ORDER BY CASE c.review_status WHEN 'pending' THEN 0 WHEN 'needs_changes' THEN 1 ELSE 2 END,c.id DESC""")
+    return {"ok": True, "accounts": accounts, "investigations": investigations_rows, "restrictions": restrictions,
+            "executions": executions, "system_trades": system_trades, "settlements": settlements, "issuers": issuers,
+            "halts": halts, "delistings": delistings, "holdings": holdings, "pnl_windows": pnl_windows,
+            "asset_pool": pool, "asset_ledger": asset_ledger, "equity_resets": equity_resets,
+            "share_resets": share_resets, "ipo_reviews": ipo_reviews}
+
+
+@router.post("/admin/fec/restrictions")
+def restrict_account(payload: AccountRestrictionRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        account = one(connection, """SELECT a.*,r.account_id AS ravenhood_account_id,r.display_name FROM market_accounts a
+            JOIN fcx_ravenhood_accounts r ON r.id=a.user_id WHERE a.id=:id""", {"id": payload.account_id})
+        if not account:
+            raise HTTPException(status_code=404, detail="Ravenhood market account not found")
+        existing = one(connection, "SELECT id FROM market_account_trading_restrictions WHERE account_id=:id AND status='active'", {"id": payload.account_id})
+        if existing:
+            raise HTTPException(status_code=409, detail="This account already has an active FEC restriction")
+        row = one(connection, """INSERT INTO market_account_trading_restrictions
+            (account_id,scope,status,reason,case_reference,created_by,created_by_name,created_at)
+            VALUES (:account,:scope,'active',:reason,:case,:user,:name,:now) RETURNING id""",
+            {"account": payload.account_id, "scope": payload.scope, "reason": payload.reason, "case": payload.case_reference,
+             "user": user["id"], "name": user["display_name"], "now": utcnow().isoformat()})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.account.restricted", target_type="ravenhood_account", target_id=account["ravenhood_account_id"], new=payload.model_dump(), request=request)
+    return {"ok": True, "restriction_id": row["id"]}
+
+
+@router.post("/admin/fec/restrictions/{restriction_id}/release")
+def release_account_restriction(restriction_id: int, payload: ReleaseRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        existing = one(connection, "SELECT * FROM market_account_trading_restrictions WHERE id=:id AND status='active'", {"id": restriction_id})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Active account restriction not found")
+        execute(connection, """UPDATE market_account_trading_restrictions SET status='released',released_by=:user,released_by_name=:name,
+            released_at=:now,release_note=:note WHERE id=:id""", {"id": restriction_id, "user": user["id"], "name": user["display_name"], "now": utcnow().isoformat(), "note": payload.note})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.account.restriction_released", target_type="account_restriction", target_id=str(restriction_id), previous=existing, new={"note": payload.note}, request=request)
+    return {"ok": True}
+
+
+@router.post("/admin/fec/custody/seize")
+def seize_fec_assets(payload: AssetSeizureRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    now = utcnow().isoformat()
+    with transaction() as connection:
+        locked_account = one(connection, "SELECT id FROM market_accounts WHERE id=:id FOR UPDATE", {"id": payload.account_id})
+        if not locked_account:
+            raise HTTPException(status_code=404, detail="Ravenhood market account not found")
+        account = one(connection, """SELECT a.id,a.user_id,a.cash_balance,r.account_id AS ravenhood_account_id,r.display_name,
+            COALESCE(MAX(NULLIF(l.bohemia_identity_id,'')),'') AS bohemia_identity_id
+            FROM market_accounts a JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+            LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+            WHERE a.id=:id GROUP BY a.id,r.id""", {"id": payload.account_id})
+        if not account:
+            raise HTTPException(status_code=404, detail="Ravenhood market account not found")
+        available = Decimal(str(account["cash_balance"] or 0))
+        if payload.amount > available:
+            raise HTTPException(status_code=409, detail="Seizure exceeds settled Ravenhood cash")
+        execute(connection, "UPDATE market_accounts SET cash_balance=cash_balance-:amount,updated_at=:now WHERE id=:id", {"amount": payload.amount, "now": now, "id": payload.account_id})
+        pool = one(connection, "UPDATE market_fec_asset_pool SET balance=balance+:amount,updated_at=:now WHERE id=1 RETURNING balance", {"amount": payload.amount, "now": now}) or {"balance": payload.amount}
+        ledger = one(connection, """INSERT INTO market_fec_asset_ledger
+            (event_type,amount,pool_delta,pool_balance_after,market_account_id,target_user_id,target_name,target_account_id,
+             target_identity_id,case_reference,reason,created_by,created_by_name,created_at)
+            VALUES ('seizure',:amount,:amount,:balance,:account,:user_id,:name,:account_id,:identity,:case,:reason,:actor,:actor_name,:now)
+            RETURNING id""", {"amount": payload.amount, "balance": pool["balance"], "account": payload.account_id,
+            "user_id": account["user_id"], "name": account["display_name"], "account_id": account["ravenhood_account_id"],
+            "identity": account["bohemia_identity_id"], "case": payload.case_reference, "reason": payload.reason,
+            "actor": user["id"], "actor_name": user["display_name"], "now": now})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.assets.seized", target_type="ravenhood_account", target_id=account["ravenhood_account_id"], new=payload.model_dump(), request=request)
+    return {"ok": True, "ledger_id": ledger["id"], "pool_balance": pool["balance"]}
+
+
+@router.post("/admin/fec/custody/dispositions")
+def dispose_fec_assets(payload: AssetDispositionRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    now = utcnow().isoformat()
+    allocations: list[dict[str, Any]] = []
+    target: dict[str, Any] = {}
+    with transaction() as connection:
+        pool = one(connection, "SELECT balance FROM market_fec_asset_pool WHERE id=1 FOR UPDATE") or {"balance": 0}
+        if payload.amount > Decimal(str(pool["balance"] or 0)):
+            raise HTTPException(status_code=409, detail="Disposition exceeds the FEC custody pool")
+        if payload.disposition == "return":
+            if not payload.target_account_id:
+                raise HTTPException(status_code=400, detail="A cleared resident account is required for return")
+            locked_target = one(connection, "SELECT id FROM market_accounts WHERE id=:id FOR UPDATE", {"id": payload.target_account_id})
+            if not locked_target:
+                raise HTTPException(status_code=404, detail="Return account not found")
+            target = one(connection, """SELECT a.id,a.user_id,r.account_id AS ravenhood_account_id,r.display_name,
+                COALESCE(MAX(NULLIF(l.bohemia_identity_id,'')),'') AS bohemia_identity_id
+                FROM market_accounts a JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+                LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+                WHERE a.id=:id GROUP BY a.id,r.id""", {"id": payload.target_account_id}) or {}
+            if not target:
+                raise HTTPException(status_code=404, detail="Return account not found")
+            execute(connection, "UPDATE market_accounts SET cash_balance=cash_balance+:amount,updated_at=:now WHERE id=:id", {"amount": payload.amount, "now": now, "id": payload.target_account_id})
+        elif payload.disposition == "reinvest":
+            securities = all_rows(connection, """SELECT id,ticker,price,issued_shares,(price*issued_shares) AS market_cap
+                FROM market_securities WHERE active=1 AND lifecycle_status='active' AND price>0 AND issued_shares>0 ORDER BY ticker FOR UPDATE""")
+            total_cap = sum((Decimal(str(row["market_cap"] or 0)) for row in securities), Decimal("0"))
+            if not securities or total_cap <= 0:
+                raise HTTPException(status_code=409, detail="No active market capitalization is available for reinvestment")
+            remaining = payload.amount
+            for index, security in enumerate(securities):
+                cap = Decimal(str(security["market_cap"] or 0))
+                allocation = remaining if index == len(securities) - 1 else (payload.amount * cap / total_cap).quantize(Decimal("0.01"))
+                remaining -= allocation
+                old_price = Decimal(str(security["price"]))
+                shares = Decimal(str(security["issued_shares"]))
+                new_price = ((cap + allocation) / shares).quantize(Decimal("0.0001"))
+                volume = (allocation / old_price).quantize(Decimal("0.00000001"))
+                change = ((new_price / old_price - 1) * 100).quantize(Decimal("0.0001"))
+                execute(connection, "UPDATE market_securities SET price=:price,updated_at=:now WHERE id=:id", {"price": new_price, "now": now, "id": security["id"]})
+                execute(connection, "INSERT INTO market_price_history (security_id,price,source,recorded_at) VALUES (:id,:price,'fec_reinvestment',:now)", {"id": security["id"], "price": new_price, "now": now})
+                execute(connection, """INSERT INTO market_system_trades
+                    (security_id,buy_volume,sell_volume,buy_trade_count,sell_trade_count,reference_price,price_change_percent,source,rationale,created_at)
+                    VALUES (:id,:volume,0,1,0,:price,:change,'fec_reinvestment',:reason,:now)""",
+                    {"id": security["id"], "volume": volume, "price": new_price, "change": change, "reason": payload.reason, "now": now})
+                allocations.append({"ticker": security["ticker"], "amount": str(allocation), "old_price": str(old_price), "new_price": str(new_price)})
+        next_pool = Decimal(str(pool["balance"] or 0)) - payload.amount
+        execute(connection, "UPDATE market_fec_asset_pool SET balance=:balance,updated_at=:now WHERE id=1", {"balance": next_pool, "now": now})
+        ledger = one(connection, """INSERT INTO market_fec_asset_ledger
+            (event_type,amount,pool_delta,pool_balance_after,market_account_id,target_user_id,target_name,target_account_id,
+             target_identity_id,case_reference,reason,allocation_json,created_by,created_by_name,created_at)
+            VALUES (:event,:amount,:delta,:balance,:account,:target_user,:name,:target_account,:identity,:case,:reason,
+             CAST(:allocations AS jsonb),:actor,:actor_name,:now) RETURNING id""", {"event": payload.disposition,
+            "amount": payload.amount, "delta": -payload.amount, "balance": next_pool, "account": target.get("id"),
+            "target_user": target.get("user_id"), "name": target.get("display_name", ""),
+            "target_account": target.get("ravenhood_account_id", ""), "identity": target.get("bohemia_identity_id", ""),
+            "case": payload.case_reference, "reason": payload.reason, "allocations": json.dumps(allocations),
+            "actor": user["id"], "actor_name": user["display_name"], "now": now})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action=f"fec.assets.{payload.disposition}", target_type="fec_asset_pool", target_id="1", new={**payload.model_dump(), "allocations": allocations}, request=request)
+    return {"ok": True, "ledger_id": ledger["id"], "pool_balance": next_pool, "allocations": allocations}
+
+
+@router.post("/admin/fec/ipos/{company_id}/decision")
+def review_ipo(company_id: int, payload: IpoReviewRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    now = utcnow().isoformat()
+    with transaction() as connection:
+        company = one(connection, "SELECT * FROM business_issuer_companies WHERE id=:id FOR UPDATE", {"id": company_id})
+        if not company:
+            raise HTTPException(status_code=404, detail="IPO filing not found")
+        execute(connection, """UPDATE business_issuer_companies SET review_status=:decision,review_note=:note,
+            reviewed_at=:now,reviewed_by=:user,updated_at=:now WHERE id=:id""", {"decision": payload.decision,
+            "note": payload.note, "now": now, "user": user["id"], "id": company_id})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.ipo.reviewed", target_type="issuer_company", target_id=str(company_id), previous=company, new=payload.model_dump(), request=request)
+    return {"ok": True}
+
+
+@router.post("/admin/fec/resets/equity")
+def wipe_fcx_equity(payload: DestructiveResetRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
+    if payload.confirmation != "WIPE FCX EQUITY":
+        raise HTTPException(status_code=400, detail="Exact equity reset confirmation is required")
+    now = utcnow().isoformat()
+    with transaction() as connection:
+        totals = one(connection, "SELECT COUNT(*) AS accounts,COALESCE(SUM(cash_balance),0) AS amount FROM market_accounts") or {}
+        execute(connection, "UPDATE market_accounts SET cash_balance=0,updated_at=:now", {"now": now})
+        execute(connection, "INSERT INTO market_fec_equity_cash_resets (affected_accounts,removed_amount,reason,created_by,created_by_name,created_at) VALUES (:accounts,:amount,:reason,:user,:name,:now)", {"accounts": totals.get("accounts", 0), "amount": totals.get("amount", 0), "reason": payload.reason, "user": user["id"], "name": user["display_name"], "now": now})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.equity.reset", target_type="market_accounts", new=totals, reason=payload.reason, request=request)
+    return {"ok": True, **totals}
+
+
+@router.post("/admin/fec/resets/shares")
+def wipe_fcx_shares(payload: DestructiveResetRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
+    if payload.confirmation != "WIPE FCX SHARES":
+        raise HTTPException(status_code=400, detail="Exact share reset confirmation is required")
+    now = utcnow().isoformat()
+    with transaction() as connection:
+        totals = one(connection, "SELECT COUNT(DISTINCT account_id) AS accounts,COALESCE(SUM(quantity),0) AS shares FROM market_holdings") or {}
+        execute(connection, "DELETE FROM market_holdings")
+        execute(connection, "INSERT INTO market_fec_share_resets (affected_accounts,removed_shares,reason,created_by,created_by_name,created_at) VALUES (:accounts,:shares,:reason,:user,:name,:now)", {"accounts": totals.get("accounts", 0), "shares": totals.get("shares", 0), "reason": payload.reason, "user": user["id"], "name": user["display_name"], "now": now})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.shares.reset", target_type="market_holdings", new=totals, reason=payload.reason, request=request)
+    return {"ok": True, **totals}
 
 
 @router.get("/admin/credentials")
@@ -443,7 +1205,7 @@ def credentials(_: dict[str, Any] = Depends(require_roles("fcx_admin", "commissi
 
 
 @router.post("/admin/investigations")
-def open_investigation(payload: InvestigationRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer"))) -> dict[str, Any]:
+def open_investigation(payload: InvestigationRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
     case_id = "FEC-" + utcnow().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
     with transaction() as connection:
         execute(
