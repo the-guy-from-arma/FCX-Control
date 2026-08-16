@@ -28,9 +28,13 @@ class Settings:
     bootstrap_community_id: str
     bootstrap_community_name: str
     bootstrap_community_api_key: str
+    bootstrap_community_bank_bridge_url: str
+    bootstrap_community_bank_secret_env: str
     bootstrap_cad2_community_id: str
     bootstrap_cad2_community_name: str
     bootstrap_cad2_community_api_key: str
+    bootstrap_cad2_community_bank_bridge_url: str
+    bootstrap_cad2_community_bank_secret_env: str
     api_rate_limit_per_minute: int
 
     @classmethod
@@ -51,9 +55,13 @@ class Settings:
             bootstrap_community_id=str(os.environ.get("FCX_BOOTSTRAP_COMMUNITY_ID") or "").strip().lower(),
             bootstrap_community_name=str(os.environ.get("FCX_BOOTSTRAP_COMMUNITY_NAME") or "").strip(),
             bootstrap_community_api_key=str(os.environ.get("FCX_BOOTSTRAP_COMMUNITY_API_KEY") or "").strip(),
+            bootstrap_community_bank_bridge_url=str(os.environ.get("FCX_BOOTSTRAP_BANK_BRIDGE_URL") or "").strip().rstrip("/"),
+            bootstrap_community_bank_secret_env=str(os.environ.get("FCX_BOOTSTRAP_BANK_SECRET_ENV") or "").strip(),
             bootstrap_cad2_community_id=str(os.environ.get("FCX_BOOTSTRAP_CAD2_COMMUNITY_ID") or "").strip().lower(),
             bootstrap_cad2_community_name=str(os.environ.get("FCX_BOOTSTRAP_CAD2_COMMUNITY_NAME") or "").strip(),
             bootstrap_cad2_community_api_key=str(os.environ.get("FCX_BOOTSTRAP_CAD2_COMMUNITY_API_KEY") or "").strip(),
+            bootstrap_cad2_community_bank_bridge_url=str(os.environ.get("FCX_BOOTSTRAP_CAD2_BANK_BRIDGE_URL") or "").strip().rstrip("/"),
+            bootstrap_cad2_community_bank_secret_env=str(os.environ.get("FCX_BOOTSTRAP_CAD2_BANK_SECRET_ENV") or "").strip(),
             api_rate_limit_per_minute=max(10, int(os.environ.get("FCX_API_RATE_LIMIT_PER_MINUTE", "120"))),
         )
 

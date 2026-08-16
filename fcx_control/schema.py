@@ -227,6 +227,8 @@ def _ensure_community_credential(
     community_name: str,
     presented: str,
     variable_prefix: str,
+    bank_bridge_url: str = "",
+    bank_secret_env: str = "",
 ) -> None:
     if not community_id and not presented:
         return
@@ -239,6 +241,10 @@ def _ensure_community_credential(
     credential_id, secret = presented.split(".", 1)
     if not credential_id.startswith("fcx_") or not secret:
         raise RuntimeError(f"{variable_prefix}_COMMUNITY_API_KEY is malformed")
+    if bool(bank_bridge_url) != bool(bank_secret_env):
+        raise RuntimeError(
+            f"{variable_prefix}_BANK_BRIDGE_URL and {variable_prefix}_BANK_SECRET_ENV must be configured together"
+        )
 
     execute(
         connection,
@@ -254,6 +260,25 @@ def _ensure_community_credential(
             "now": now,
         },
     )
+
+    # Bridge routing belongs to the FCX community record. Only overwrite it
+    # when both bootstrap variables are explicitly present so an ordinary
+    # restart cannot erase an operator-managed route.
+    if bank_bridge_url and bank_secret_env:
+        execute(
+            connection,
+            """UPDATE fcx_communities
+                SET bank_bridge_url=:bank_bridge_url,
+                    bank_secret_env=:bank_secret_env,
+                    updated_at=:now
+                WHERE community_id=:community_id""",
+            {
+                "community_id": community_id,
+                "bank_bridge_url": bank_bridge_url.rstrip("/"),
+                "bank_secret_env": bank_secret_env,
+                "now": now,
+            },
+        )
 
     execute(
         connection,
@@ -285,6 +310,8 @@ def _ensure_bootstrap_community_credentials(connection, now: datetime) -> None:
         settings.bootstrap_community_name,
         settings.bootstrap_community_api_key,
         "FCX_BOOTSTRAP",
+        settings.bootstrap_community_bank_bridge_url,
+        settings.bootstrap_community_bank_secret_env,
     )
     _ensure_community_credential(
         connection,
@@ -293,6 +320,8 @@ def _ensure_bootstrap_community_credentials(connection, now: datetime) -> None:
         settings.bootstrap_cad2_community_name,
         settings.bootstrap_cad2_community_api_key,
         "FCX_BOOTSTRAP_CAD2",
+        settings.bootstrap_cad2_community_bank_bridge_url,
+        settings.bootstrap_cad2_community_bank_secret_env,
     )
 
 
