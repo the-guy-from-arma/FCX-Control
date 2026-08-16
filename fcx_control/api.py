@@ -1967,7 +1967,9 @@ def _linked_market_account(
     restrictions = all_rows(
         connection,
         """SELECT id,scope,reason,created_at FROM market_account_trading_restrictions
-           WHERE account_id=:account AND status='active' ORDER BY id DESC""",
+           WHERE account_id=:account AND status='active'
+             AND NULLIF(BTRIM(COALESCE(reason,'')),'') IS NOT NULL
+           ORDER BY id DESC""",
         {"account": row["market_account_id"]},
     )
     for restriction in restrictions:

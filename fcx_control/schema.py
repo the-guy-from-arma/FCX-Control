@@ -383,6 +383,43 @@ def _ensure_bootstrap_community_credentials(connection, now: datetime) -> None:
     )
 
 
+def _repair_undocumented_legacy_account_restrictions(connection, now: datetime) -> None:
+    """Release pre-split account locks that have no FEC documentation.
+
+    Current restriction creation requires a documented reason.  Some legacy
+    rows copied during the FCX split have an active status but an empty reason,
+    which makes an otherwise unrestricted resident appear blocked everywhere.
+    Preserve every documented restriction and release only those invalid rows.
+    """
+    repair_key = "undocumented-legacy-account-restrictions-v1"
+    repaired = one(
+        connection,
+        "SELECT repair_key FROM fcx_control_schema_repairs WHERE repair_key=:repair_key",
+        {"repair_key": repair_key},
+    )
+    if repaired:
+        return
+    execute(
+        connection,
+        """UPDATE market_account_trading_restrictions
+            SET status='released',
+                released_at=:now,
+                released_by=NULL,
+                released_by_name='FCX migration repair',
+                release_note='Released undocumented legacy restriction after FCX split.'
+            WHERE status='active'
+              AND NULLIF(BTRIM(COALESCE(reason,'')),'') IS NULL""",
+        {"now": now},
+    )
+    execute(
+        connection,
+        """INSERT INTO fcx_control_schema_repairs (repair_key,completed_at)
+            VALUES (:repair_key,:now)
+            ON CONFLICT(repair_key) DO NOTHING""",
+        {"repair_key": repair_key, "now": now},
+    )
+
+
 def ensure_identity_schema() -> None:
     """Create FCX control identities before exchange tables reference them."""
     now = datetime.now(timezone.utc)
@@ -401,3 +438,4 @@ def ensure_schema() -> None:
             execute(connection, statement)
         _ensure_bootstrap_admin(connection, now)
         _ensure_bootstrap_community_credentials(connection, now)
+        _repair_undocumented_legacy_account_restrictions(connection, now)
