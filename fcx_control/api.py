@@ -2219,16 +2219,16 @@ def community_market(
         history_rows = all_rows(
             connection,
             """WITH execution_flow AS (
-                   SELECT security_id,date_trunc('minute',created_at) AS minute_bucket,
+                   SELECT security_id,date_trunc('minute',created_at::timestamptz) AS minute_bucket,
                            SUM(COALESCE(buy_volume,0)) AS buy_volume,
                            SUM(COALESCE(sell_volume,0)) AS sell_volume,
                            SUM(COALESCE(buy_trade_count,0)) AS buy_trade_count,
                            SUM(COALESCE(sell_trade_count,0)) AS sell_trade_count,
                            SUM((COALESCE(buy_volume,0)+COALESCE(sell_volume,0))*COALESCE(reference_price,0)) AS traded_notional
                    FROM market_system_trades
-                   WHERE created_at>=:since
+                   WHERE created_at::timestamptz>=:since
                      AND (COALESCE(buy_volume,0)>0 OR COALESCE(sell_volume,0)>0)
-                   GROUP BY security_id,date_trunc('minute',created_at)
+                   GROUP BY security_id,date_trunc('minute',created_at::timestamptz)
                ), ranked_history AS (
                    SELECT s.ticker,h.price,h.source,h.recorded_at,
                           COALESCE(f.buy_volume,0) AS buy_volume,
@@ -2240,9 +2240,9 @@ def community_market(
                    FROM market_price_history h
                    JOIN market_securities s ON s.id=h.security_id
                    LEFT JOIN execution_flow f ON f.security_id=h.security_id
-                    AND f.minute_bucket=date_trunc('minute',h.recorded_at)
+                    AND f.minute_bucket=date_trunc('minute',h.recorded_at::timestamptz)
                    WHERE s.active=1 AND s.lifecycle_status='active'
-                     AND h.recorded_at>=:since
+                     AND h.recorded_at::timestamptz>=:since
                      AND (:ticker='' OR UPPER(s.ticker)=:ticker)
                )
                SELECT ticker,price,source,recorded_at,buy_volume,sell_volume,
