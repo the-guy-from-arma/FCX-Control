@@ -8,6 +8,7 @@ engine-owned state plus the established Ravenhood quote/tape tables.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from contextlib import contextmanager
@@ -99,6 +100,8 @@ engine = create_engine(
 )
 scheduler = BackgroundScheduler(timezone="UTC", daemon=True)
 worker_guard = threading.Lock()
+settlement_guard = threading.Lock()
+logger = logging.getLogger(__name__)
 app = FastAPI(title="FCX Autonomous Market Engine", version="1.0.0")
 
 
@@ -144,6 +147,28 @@ def scheduler_tick() -> None:
         worker_guard.release()
 
 
+def settlement_reconciliation_tick() -> None:
+    """Credit/debit FCX wallets after asynchronous Bank Bridge completion."""
+    if not settlement_guard.acquire(blocking=False):
+        return
+    try:
+        # Local import avoids the intentional service/api import cycle during
+        # module startup; the router has finished loading before this job runs.
+        from fcx_control.api import reconcile_authorized_settlements
+
+        batch_size = max(1, min(int(os.environ.get("FCX_SETTLEMENT_RECONCILE_BATCH", "50")), 200))
+        result = reconcile_authorized_settlements(limit=batch_size)
+        if result.get("settled") or result.get("advanced"):
+            logger.info("FCX settlement reconciliation: %s", result)
+        elif result.get("errors"):
+            logger.warning("FCX settlement reconciliation encountered bridge errors: %s", result)
+    except Exception:
+        # Settlement polling must never stop the market engine scheduler.
+        logger.exception("FCX settlement reconciliation failed")
+    finally:
+        settlement_guard.release()
+
+
 @app.on_event("startup")
 def startup() -> None:
     # Control identities and communities must exist before the exchange-owned
@@ -158,6 +183,15 @@ def startup() -> None:
     run_scheduler = str(os.environ.get("FCX_RUN_SCHEDULER", "1")).strip().lower() in {"1", "true", "yes", "on"}
     if run_scheduler and not scheduler.running:
         scheduler.add_job(scheduler_tick, "interval", seconds=15, id="fcx_market_clock", max_instances=1, coalesce=True)
+        reconcile_seconds = max(3, int(os.environ.get("FCX_SETTLEMENT_RECONCILE_SECONDS", "5")))
+        scheduler.add_job(
+            settlement_reconciliation_tick,
+            "interval",
+            seconds=reconcile_seconds,
+            id="fcx_settlement_reconciliation",
+            max_instances=1,
+            coalesce=True,
+        )
         scheduler.start()
 
 

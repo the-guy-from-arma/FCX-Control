@@ -1679,6 +1679,66 @@ def refresh_settlement(settlement_id: str, principal: dict[str, Any] = Depends(r
     return {"ok": True, "idempotent_replay": str(current["state"]) == str(updated["state"]), "settlement": updated}
 
 
+def reconcile_authorized_settlements(limit: int = 50) -> dict[str, int]:
+    """Advance bank-authorized commands after the CAD bridge finishes them.
+
+    The CAD adapter can only acknowledge a newly queued Bank Bridge command as
+    ``BANK_AUTHORIZED``.  Its final debit/credit state arrives later, after the
+    game bridge has processed the command.  This reconciler deliberately reads
+    candidates in one short transaction, performs each network request outside
+    that transaction, and relies on ``_apply_bank_reply``'s row lock plus the
+    wallet timestamp fields for exactly-once wallet application.
+    """
+    batch_size = max(1, min(int(limit), 200))
+    with transaction() as connection:
+        candidates = all_rows(
+            connection,
+            """SELECT settlement_id,community_id
+               FROM fcx_settlements
+               WHERE state='BANK_AUTHORIZED'
+               ORDER BY updated_at ASC,id ASC
+               LIMIT :limit""",
+            {"limit": batch_size},
+        )
+
+    result = {"checked": 0, "advanced": 0, "settled": 0, "pending": 0, "errors": 0}
+    for candidate in candidates:
+        settlement_id = str(candidate.get("settlement_id") or "")
+        community_id = str(candidate.get("community_id") or "")
+        if not settlement_id or not community_id:
+            result["errors"] += 1
+            continue
+        result["checked"] += 1
+        try:
+            reply = _bank_bridge_request(
+                community_id=community_id,
+                settlement_id=settlement_id,
+                method="GET",
+            )
+            reply_state = str(reply.get("state") or "BANK_AUTHORIZED").upper()
+            # Avoid rewriting the settlement and audit log while the game-side
+            # command is legitimately still waiting for its player/bridge.
+            if reply_state == "BANK_AUTHORIZED":
+                result["pending"] += 1
+                continue
+            updated = _apply_bank_reply(
+                community_id=community_id,
+                settlement_id=settlement_id,
+                reply=reply,
+                audit_action="settlement.automatically_reconciled",
+            )
+            result["advanced"] += 1
+            if str(updated.get("state") or "").upper() == "SETTLED":
+                result["settled"] += 1
+        except HTTPException:
+            # A transient CAD/bridge failure must not reverse, duplicate, or
+            # fail a command that may already have moved money in game.
+            result["errors"] += 1
+        except Exception:
+            result["errors"] += 1
+    return result
+
+
 @router.post("/community/settlements/{settlement_id}/callback")
 def settlement_callback(settlement_id: str, payload: SettlementCallback, principal: dict[str, Any] = Depends(require_community_scopes("settlement:write"))) -> dict[str, Any]:
     community_id = str(principal["community_id"])
