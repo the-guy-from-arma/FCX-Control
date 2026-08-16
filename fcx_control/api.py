@@ -1918,6 +1918,25 @@ def _setting_enabled(connection: Any, key: str, default: bool = True) -> bool:
     return str(row.get("setting_value") or "").strip().lower() in {"1", "true", "yes", "on", "open", "enabled"}
 
 
+def _normalize_trading_restriction_scope(value: Any) -> str:
+    """Translate legacy and UI restriction labels into the FCX enforcement lanes."""
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"full", "all", "account", "account_wide"}:
+        return "full"
+    if normalized in {"equity", "share", "shares", "share_trading", "stock", "stocks"}:
+        return "equity"
+    if normalized in {"leverage", "leveraged", "margin", "leverage_trading"}:
+        return "leverage"
+    # Unknown historical scopes must remain restrictive until an investigator clears them.
+    return "full"
+
+
+def _restriction_blocks_lane(scope: Any, lane: str) -> bool:
+    restriction_scope = _normalize_trading_restriction_scope(scope)
+    requested_lane = _normalize_trading_restriction_scope(lane)
+    return restriction_scope == "full" or restriction_scope == requested_lane
+
+
 def _linked_market_account(
     connection: Any,
     *,
@@ -1926,6 +1945,7 @@ def _linked_market_account(
     account_id: str,
     lock: bool = False,
     enforce_restrictions: bool = True,
+    restriction_lane: str = "full",
 ) -> dict[str, Any]:
     suffix = " FOR UPDATE OF ma" if lock else ""
     row = one(
@@ -1950,12 +1970,30 @@ def _linked_market_account(
            WHERE account_id=:account AND status='active' ORDER BY id DESC""",
         {"account": row["market_account_id"]},
     )
+    for restriction in restrictions:
+        restriction["scope"] = _normalize_trading_restriction_scope(restriction.get("scope"))
+    blocking_restrictions = [
+        restriction
+        for restriction in restrictions
+        if _restriction_blocks_lane(restriction.get("scope"), restriction_lane)
+    ]
+    equity_restriction = next(
+        (restriction for restriction in restrictions if _restriction_blocks_lane(restriction.get("scope"), "equity")),
+        None,
+    )
+    leverage_restriction = next(
+        (restriction for restriction in restrictions if _restriction_blocks_lane(restriction.get("scope"), "leverage")),
+        None,
+    )
     row["trading_restrictions"] = restrictions
     row["is_restricted"] = bool(restrictions)
-    row["restriction_scope"] = str((restrictions[0] if restrictions else {}).get("scope") or "")
-    row["restriction_reason"] = str((restrictions[0] if restrictions else {}).get("reason") or "")
-    if enforce_restrictions and restrictions:
-        raise HTTPException(status_code=403, detail="Ravenhood trading account is restricted by FEC")
+    row["equity_restricted"] = equity_restriction is not None
+    row["leverage_restricted"] = leverage_restriction is not None
+    row["restriction_scope"] = str((blocking_restrictions[0] if blocking_restrictions else restrictions[0] if restrictions else {}).get("scope") or "")
+    row["restriction_reason"] = str((blocking_restrictions[0] if blocking_restrictions else restrictions[0] if restrictions else {}).get("reason") or "")
+    if enforce_restrictions and blocking_restrictions:
+        lane_label = "share" if _normalize_trading_restriction_scope(restriction_lane) == "equity" else "leverage"
+        raise HTTPException(status_code=403, detail=f"Ravenhood {lane_label} trading is restricted by FEC")
     return row
 
 
@@ -2462,7 +2500,14 @@ def create_trade_order(
         if existing:
             return {"ok": True, "idempotent_replay": True, "trade": _trade_response(connection, str(existing["trade_request_id"]), community_id)}
         _assert_market_access(connection, principal, payload.side)
-        account = _linked_market_account(connection, community_id=community_id, community_user_id=payload.community_user_id, account_id=payload.account_id, lock=True)
+        account = _linked_market_account(
+            connection,
+            community_id=community_id,
+            community_user_id=payload.community_user_id,
+            account_id=payload.account_id,
+            lock=True,
+            restriction_lane="equity",
+        )
         security = _security_for_trade(connection, ticker, side=payload.side, lock=True)
         quantity = _quantity(payload.quantity)
         price = Decimal(str(security["price"]))

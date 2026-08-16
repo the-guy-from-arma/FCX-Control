@@ -54,6 +54,10 @@ DDL = (
         created_at TIMESTAMPTZ NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS fcx_control_schema_repairs (
+        repair_key TEXT PRIMARY KEY,
+        completed_at TIMESTAMPTZ NOT NULL
+    )""",
     """CREATE TABLE IF NOT EXISTS fcx_community_credentials (
         id BIGSERIAL PRIMARY KEY,
         community_id TEXT NOT NULL,
@@ -260,7 +264,6 @@ def _ensure_community_credential(
             "now": now,
         },
     )
-
     # Bridge routing belongs to the FCX community record. Only overwrite it
     # when both bootstrap variables are explicitly present so an ordinary
     # restart cannot erase an operator-managed route.
@@ -302,6 +305,51 @@ def _ensure_community_credential(
     )
 
 
+def _repair_bootstrap_community_trading_defaults(
+    connection,
+    now: datetime,
+    community_id: str,
+) -> None:
+    """Restore bootstrap community trading once after the FCX split.
+
+    Community-wide trading flags were copied from the pre-split control state
+    for some deployments.  A disabled flag there makes every linked resident
+    appear FEC-restricted even when no account restriction exists.  This is a
+    one-time schema repair so later operator changes remain authoritative.
+    """
+    community_id = str(community_id or "").strip()
+    if not community_id:
+        return
+    repair_key = f"bootstrap-community-trading-v1:{community_id}"
+    repaired = one(
+        connection,
+        "SELECT repair_key FROM fcx_control_schema_repairs WHERE repair_key=:repair_key",
+        {"repair_key": repair_key},
+    )
+    if repaired:
+        return
+    execute(
+        connection,
+        """UPDATE fcx_communities
+            SET trading_enabled=TRUE,
+                buy_enabled=TRUE,
+                sell_enabled=TRUE,
+                updated_at=:now
+            WHERE community_id=:community_id
+              AND status='active'
+              AND connection_enabled=TRUE
+              AND suspended=FALSE""",
+        {"community_id": community_id, "now": now},
+    )
+    execute(
+        connection,
+        """INSERT INTO fcx_control_schema_repairs (repair_key,completed_at)
+            VALUES (:repair_key,:now)
+            ON CONFLICT(repair_key) DO NOTHING""",
+        {"repair_key": repair_key, "now": now},
+    )
+
+
 def _ensure_bootstrap_community_credentials(connection, now: datetime) -> None:
     _ensure_community_credential(
         connection,
@@ -322,6 +370,16 @@ def _ensure_bootstrap_community_credentials(connection, now: datetime) -> None:
         "FCX_BOOTSTRAP_CAD2",
         settings.bootstrap_cad2_community_bank_bridge_url,
         settings.bootstrap_cad2_community_bank_secret_env,
+    )
+    _repair_bootstrap_community_trading_defaults(
+        connection,
+        now,
+        settings.bootstrap_community_id,
+    )
+    _repair_bootstrap_community_trading_defaults(
+        connection,
+        now,
+        settings.bootstrap_cad2_community_id,
     )
 
 
