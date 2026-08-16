@@ -682,6 +682,122 @@ def _load_securities(db: Any) -> list[dict[str, Any]]:
     )
 
 
+def _apply_price_programs(db: Any, config: EngineConfig, cycle_id: int, timestamp: str) -> dict[str, Any]:
+    """Advance FEC price programs into Ravenhood's authoritative quote stream.
+
+    The operations API stores scheduled movements in ``market_price_programs``.
+    Ravenhood, however, renders ``market_securities`` and
+    ``market_price_history``.  Keeping this bridge in the minute engine cycle
+    makes a program auditable and prevents the autonomous discovery pass from
+    being a separate, invisible market.
+    """
+    current_time = _parse_time(timestamp) or utcnow()
+    programs = _rows(
+        db,
+        """SELECT p.*,s.ticker,s.name,s.price AS live_price,s.issued_shares,
+                  COALESCE(s.security_type,'stock') AS security_type
+           FROM market_price_programs p
+           JOIN market_securities s ON s.id=p.security_id
+           WHERE p.status IN ('scheduled','active')
+             AND s.active=1 AND COALESCE(s.lifecycle_status,'active')='active'
+           ORDER BY p.security_id,p.id""",
+    )
+    # Only the newest simultaneously-active instruction controls a security.
+    selected: dict[int, dict[str, Any]] = {}
+    for program in programs:
+        starts_at = _parse_time(program.get("starts_at"))
+        if starts_at and starts_at <= current_time:
+            selected[int(program["security_id"])] = program
+
+    moved = 0
+    activated = 0
+    completed = 0
+    tickers: list[str] = []
+    for security_id, program in selected.items():
+        starts_at = _parse_time(program.get("starts_at")) or current_time
+        ends_at = _parse_time(program.get("ends_at")) or starts_at
+        live_price = max(config.price_floor, float(program.get("live_price") or config.price_floor))
+        start_price = max(config.price_floor, float(program.get("start_price") or live_price))
+        percent_change = float(program.get("percent_change") or 0)
+
+        if str(program.get("status") or "") == "scheduled":
+            # A future instruction locks its opening quote when it actually
+            # begins, not when an investigator created it.
+            start_price = live_price
+            target_price = max(config.price_floor, round(start_price * (1 + percent_change / 100.0), 4))
+            db.execute(
+                "UPDATE market_price_programs SET status='active',start_price=?,target_price=? WHERE id=?",
+                (start_price, target_price, program["id"]),
+            )
+            activated += 1
+        else:
+            target_price = max(config.price_floor, float(program.get("target_price") or start_price))
+
+        duration = max(1.0, (ends_at - starts_at).total_seconds())
+        progress = max(0.0, min(1.0, (current_time - starts_at).total_seconds() / duration))
+        # Smoothstep avoids an artificial vertical jump while still arriving
+        # at the exact ordered closing quote.
+        eased = progress * progress * (3.0 - 2.0 * progress)
+        new_price = max(config.price_floor, round(start_price + (target_price - start_price) * eased, 4))
+        changed = abs(new_price - live_price) >= 0.00005
+        if changed:
+            movement = ((new_price / live_price) - 1.0) * 100.0 if live_price else 0.0
+            issued = max(1.0, float(program.get("issued_shares") or 1_000_000))
+            volume = round(max(1.0, min(issued * 0.0025, issued * max(0.00001, abs(movement) * 0.0001))), 6)
+            is_up = new_price >= live_price
+            db.execute(
+                "UPDATE market_securities SET previous_price=price,price=?,updated_at=? WHERE id=?",
+                (new_price, timestamp, security_id),
+            )
+            db.execute(
+                "INSERT INTO market_price_history (security_id,price,source,recorded_at) VALUES (?,?,'fec_price_program',?)",
+                (security_id, new_price, timestamp),
+            )
+            db.execute(
+                """INSERT INTO market_system_trades
+                   (security_id,buy_volume,sell_volume,buy_trade_count,sell_trade_count,reference_price,
+                    price_change_percent,source,rationale,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (security_id, volume if is_up else 0, 0 if is_up else volume, 1 if is_up else 0,
+                 0 if is_up else 1, new_price, round(movement, 4), "fec_price_program",
+                 str(program.get("event_name") or "FEC scheduled price program")[:300], timestamp),
+            )
+            db.execute(
+                """INSERT INTO fcx_engine_audit_log
+                   (cycle_id,security_id,ticker,action,shares,price,notional,reason_json,confidence,
+                    market_sentiment,stock_sentiment,risk_score,created_at)
+                   VALUES (?,?,?,'FEC_PRICE_PROGRAM',?,?,0,?,100,50,50,0,?)""",
+                (cycle_id, security_id, program.get("ticker"), volume, new_price,
+                 json.dumps([str(program.get("event_name") or "FEC scheduled price program")], separators=(",", ":")), timestamp),
+            )
+            moved += 1
+            tickers.append(str(program.get("ticker") or security_id))
+
+        if progress >= 1.0:
+            # Index funds normally revalue from their constituents.  Rebase the
+            # NAV so a completed FEC instruction remains where it closed rather
+            # than snapping back on the next engine tick.
+            fund = _one(db, "SELECT id,base_nav FROM market_index_funds WHERE security_id=?", (security_id,))
+            if fund:
+                members = _rows(
+                    db,
+                    """SELECT m.weight,m.reference_price,s.price FROM market_index_members m
+                       JOIN market_securities s ON s.id=m.security_id WHERE m.fund_id=?""",
+                    (fund["id"],),
+                )
+                calculated = index_nav(
+                    float(fund.get("base_nav") or 100),
+                    [(float(item.get("weight") or 0), float(item.get("price") or 0),
+                      float(item.get("reference_price") or 0)) for item in members],
+                    config.price_floor,
+                ) if members else target_price
+                rebased = float(fund.get("base_nav") or 100) * target_price / max(config.price_floor, calculated)
+                db.execute("UPDATE market_index_funds SET base_nav=?,last_valued_at=? WHERE id=?", (rebased, timestamp, fund["id"]))
+            db.execute("UPDATE market_price_programs SET status='completed',target_price=?,ends_at=? WHERE id=?", (target_price, timestamp, program["id"]))
+            completed += 1
+
+    return {"active": len(selected), "activated": activated, "moved": moved, "completed": completed, "tickers": tickers}
+
+
 def _corporate_security(db: Any, ticker: str) -> dict[str, Any]:
     row = _one(
         db,
@@ -1367,8 +1483,9 @@ def _minute_cycle(db: Any, config: EngineConfig, cycle_id: int, seed: int) -> di
             (cycle_id, trade["investor"]["id"], trade["investor"]["personality"], trade["security"]["id"], trade["security"]["ticker"], trade["decision"].action, trade["quantity"], trade["price"], trade["notional"], json.dumps(trade["decision"].reasons, separators=(",", ":")), trade["decision"].confidence, market_sentiment, trade["security"].get("company_sentiment") or 50, trade["security"].get("risk_score") or 0, timestamp),
         )
     index_funds_revalued = _revalue_index_funds(db, config, cycle_id, timestamp)
+    price_programs = _apply_price_programs(db, config, cycle_id, timestamp)
     liquidity_quotes = _refresh_market_maker_quotes(db, _load_securities(db), config, timestamp, seed)
-    return {"investors_evaluated": len(investors), "trades_executed": len(executed) + len(parent_fills) + len(squeeze_fills), "parent_order_fills": len(parent_fills), "short_squeeze_covers": len(squeeze_fills), "active_events": int(market_effect["events"]), "securities_moved": moved, "index_funds_revalued": index_funds_revalued, "liquidity_quotes": liquidity_quotes, "volume": round(total_volume, 2), "human_priority_percent": round(config.human_priority * 100, 2), "execution_budget": max_evaluations, "panic_evaluated": panic_evaluated, "circuit_breakers_resumed": circuit_breakers_resumed}
+    return {"investors_evaluated": len(investors), "trades_executed": len(executed) + len(parent_fills) + len(squeeze_fills), "parent_order_fills": len(parent_fills), "short_squeeze_covers": len(squeeze_fills), "active_events": int(market_effect["events"]), "securities_moved": moved + int(price_programs["moved"]), "index_funds_revalued": index_funds_revalued, "price_programs": price_programs, "liquidity_quotes": liquidity_quotes, "volume": round(total_volume, 2), "human_priority_percent": round(config.human_priority * 100, 2), "execution_budget": max_evaluations, "panic_evaluated": panic_evaluated, "circuit_breakers_resumed": circuit_breakers_resumed}
 
 
 def _five_minute_cycle(db: Any, config: EngineConfig, seed: int) -> dict[str, Any]:
