@@ -614,7 +614,7 @@ def accounts(limit: int = 200, _: dict[str, Any] = Depends(require_roles(*ADMIN_
                LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
                LEFT JOIN market_holdings h ON h.account_id=a.id
                LEFT JOIN market_securities s ON s.id=h.security_id
-               GROUP BY r.id,a.id ORDER BY r.updated_at DESC LIMIT :limit""",
+               GROUP BY r.id,a.id ORDER BY LOWER(COALESCE(NULLIF(r.display_name,''),r.account_id)),r.account_id LIMIT :limit""",
             {"limit": safe_limit},
         )
     return {"ok": True, "accounts": rows}

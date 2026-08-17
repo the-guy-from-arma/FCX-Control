@@ -200,6 +200,13 @@ select[multiple] option:checked { color: #061310; background: linear-gradient(90
 .toggle-row button.on { border-color: rgba(85,230,165,.22); color: var(--green); background: rgba(85,230,165,.05); }
 .toggle-row button.off { border-color: rgba(255,111,126,.22); color: var(--red); background: rgba(255,111,126,.05); }
 .account-stack { display: grid; gap: 8px; }
+.account-directory-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+.account-directory-head h4,.account-directory-head p { margin: 0; }
+.account-directory-head p { margin-top: 4px; color: var(--muted); font-size: 10px; }
+.account-directory-head>strong { color: var(--primary); font-size: 10px; white-space: nowrap; }
+.account-directory-controls { display: grid; grid-template-columns: minmax(240px,2fr) repeat(3,minmax(140px,1fr)); gap: 10px; margin-bottom: 14px; }
+.account-directory-controls label { display: grid; gap: 5px; }
+.account-directory-controls label>span { color: var(--muted); font-size: 8px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
 .account-card { padding: 0; overflow: hidden; }
 .account-card summary { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 18px; padding: 15px 17px; list-style: none; cursor: pointer; }
 .account-card summary::-webkit-details-marker { display: none; }
@@ -367,6 +374,7 @@ dialog::backdrop { background: rgba(1,7,10,.75); backdrop-filter: blur(6px); }
   .role-catalog { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }
 @media (max-width: 980px) {
+  .account-directory-controls { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .overview-layout { grid-template-columns: 1fr; }
   .overview-side { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .overview-side>.panel { grid-column: auto; }
@@ -416,6 +424,8 @@ dialog::backdrop { background: rgba(1,7,10,.75); backdrop-filter: blur(6px); }
   .role-catalog { grid-template-columns: 1fr; }
 }
 @media (max-width: 460px) {
+  .account-directory-head { align-items: flex-start; flex-direction: column; }
+  .account-directory-controls { grid-template-columns: 1fr; }
   .metric-strip,.health-grid,.quick-actions { grid-template-columns: 1fr; }
   .metric strong { font-size: 22px; }
   .topbar h2 { font-size: 18px; }
