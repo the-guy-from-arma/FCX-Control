@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import secrets
 import urllib.error
@@ -304,6 +305,31 @@ class SecurityMarginPatch(BaseModel):
     margin_max_leverage: Decimal | None = Field(default=None, ge=1, le=200)
 
 
+class PromotionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    campaign_name: str = Field(min_length=2, max_length=120)
+    custom_code: str = Field(default="", max_length=32)
+    reward_type: Literal["cash", "stock", "random_bundle"]
+    cash_amount: Decimal = Field(default=Decimal("0"), ge=0, le=1_000_000_000)
+    security_id: int | None = Field(default=None, ge=1)
+    share_quantity: Decimal = Field(default=Decimal("0"), ge=0, le=1_000_000_000)
+    bundle_size: int = Field(default=0)
+    max_redemptions: int = Field(default=100, ge=1, le=100_000)
+    expiry_days: int = Field(default=30, ge=1, le=365)
+
+
+class PromotionStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    active: bool
+
+
+class PromotionRedeemRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    community_user_id: str = Field(min_length=1, max_length=200)
+    account_id: str = Field(min_length=4, max_length=200)
+    code: str = Field(min_length=6, max_length=40)
+
+
 @router.get("/health")
 def health() -> dict[str, Any]:
     with transaction() as connection:
@@ -507,6 +533,144 @@ def accounts(limit: int = 200, _: dict[str, Any] = Depends(require_roles(*ADMIN_
             {"limit": safe_limit},
         )
     return {"ok": True, "accounts": rows}
+
+
+@router.get("/admin/fec/promotions")
+def promotional_campaigns(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        campaigns = all_rows(connection, """SELECT p.*,s.ticker,s.name AS security_name
+            FROM market_promo_codes p LEFT JOIN market_securities s ON s.id=p.security_id
+            ORDER BY p.created_at DESC LIMIT 500""")
+        redemptions = all_rows(connection, """SELECT r.*,p.campaign_name,p.code_hint,
+            a.id AS market_account_id,ra.account_id AS ravenhood_account_id,ra.display_name
+            FROM market_promo_redemptions r JOIN market_promo_codes p ON p.id=r.promo_id
+            JOIN market_accounts a ON a.id=r.account_id JOIN fcx_ravenhood_accounts ra ON ra.id=a.user_id
+            ORDER BY r.redeemed_at DESC LIMIT 200""")
+        securities = all_rows(connection, """SELECT id,ticker,name FROM market_securities
+            WHERE active=1 AND lifecycle_status='active' ORDER BY ticker""")
+    return {"ok": True, "campaigns": campaigns, "redemptions": redemptions, "securities": securities}
+
+
+@router.post("/admin/fec/promotions", status_code=201)
+def create_promotional_campaign(payload: PromotionCreateRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    if payload.reward_type == "cash" and payload.cash_amount <= 0:
+        raise HTTPException(status_code=400, detail="Cash campaigns require a positive buying-power reward")
+    if payload.reward_type == "stock" and (not payload.security_id or payload.share_quantity <= 0):
+        raise HTTPException(status_code=400, detail="Stock campaigns require an active security and positive share quantity")
+    if payload.reward_type == "random_bundle" and (payload.bundle_size not in {3, 5, 9} or payload.share_quantity <= 0):
+        raise HTTPException(status_code=400, detail="Starter portfolios require 3, 5, or 9 stocks and positive shares")
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    raw_code = payload.custom_code.strip().upper().replace(" ", "")
+    if not raw_code:
+        raw_code = "FCX-" + "".join(secrets.choice(alphabet) for _ in range(4)) + "-" + "".join(secrets.choice(alphabet) for _ in range(4))
+    canonical = "".join(character for character in raw_code if character.isalnum())
+    if not 6 <= len(canonical) <= 32:
+        raise HTTPException(status_code=400, detail="Promotional codes must contain 6 to 32 letters or numbers")
+    now = utcnow()
+    expires = now + timedelta(days=payload.expiry_days)
+    with transaction() as connection:
+        security = None
+        if payload.security_id:
+            security = one(connection, "SELECT id,ticker FROM market_securities WHERE id=:id AND active=1 AND lifecycle_status='active'", {"id": payload.security_id})
+            if not security:
+                raise HTTPException(status_code=400, detail="Select an active FCX security")
+        duplicate = one(connection, "SELECT id FROM market_promo_codes WHERE code_hash=:hash", {"hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest()})
+        if duplicate:
+            raise HTTPException(status_code=409, detail="That promotional code already exists")
+        campaign = one(connection, """INSERT INTO market_promo_codes
+            (campaign_name,code_hash,code_hint,code_plain,reward_type,cash_amount,security_id,share_quantity,
+             bundle_size,max_redemptions,expires_at,active,created_by,created_by_name,created_at)
+            VALUES (:name,:hash,:hint,:code,:reward,:cash,:security,:shares,:bundle,:maximum,:expires,1,:actor,:actor_name,:created)
+            RETURNING id""", {"name": payload.campaign_name.strip(), "hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "hint": canonical[-4:], "code": raw_code, "reward": payload.reward_type, "cash": payload.cash_amount,
+            "security": security["id"] if security else None, "shares": payload.share_quantity, "bundle": payload.bundle_size,
+            "maximum": payload.max_redemptions, "expires": expires.isoformat(), "actor": user["id"],
+            "actor_name": user["display_name"], "created": now.isoformat()})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]),
+            action="fec.promotion.created", target_type="promotional_campaign", target_id=str(campaign["id"]),
+            new={**payload.model_dump(), "custom_code": "", "code_hint": canonical[-4:]}, request=request)
+    return {"ok": True, "campaign_id": campaign["id"], "campaign_name": payload.campaign_name, "code": raw_code, "expires_at": expires.isoformat()}
+
+
+@router.patch("/admin/fec/promotions/{campaign_id}")
+def update_promotional_campaign(campaign_id: int, payload: PromotionStatusRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        existing = one(connection, "SELECT * FROM market_promo_codes WHERE id=:id", {"id": campaign_id})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Promotional campaign not found")
+        execute(connection, "UPDATE market_promo_codes SET active=:active WHERE id=:id", {"active": int(payload.active), "id": campaign_id})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]),
+            action="fec.promotion.resumed" if payload.active else "fec.promotion.paused", target_type="promotional_campaign",
+            target_id=str(campaign_id), previous=existing, new=payload.model_dump(), request=request)
+    return {"ok": True, "active": payload.active}
+
+
+@router.delete("/admin/fec/promotions/{campaign_id}")
+def delete_promotional_campaign(campaign_id: int, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        existing = one(connection, "SELECT * FROM market_promo_codes WHERE id=:id", {"id": campaign_id})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Promotional campaign not found")
+        if int(existing.get("redemption_count") or 0) > 0:
+            raise HTTPException(status_code=409, detail="Redeemed campaigns must be paused and retained for the FEC audit record")
+        execute(connection, "DELETE FROM market_promo_codes WHERE id=:id", {"id": campaign_id})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]),
+            action="fec.promotion.deleted", target_type="promotional_campaign", target_id=str(campaign_id),
+            previous=existing, request=request)
+    return {"ok": True}
+
+
+@router.post("/community/promotions/redeem")
+def redeem_promotional_campaign(payload: PromotionRedeemRequest, principal: dict[str, Any] = Depends(require_community_scopes("trade:write"))) -> dict[str, Any]:
+    community_id = str(principal["community_id"])
+    canonical = "".join(character for character in payload.code.upper() if character.isalnum())
+    code_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    now = utcnow().isoformat()
+    with transaction() as connection:
+        account = one(connection, """SELECT a.id,a.status,r.account_id,r.display_name
+            FROM fcx_ravenhood_links l JOIN fcx_ravenhood_accounts r ON r.account_id=l.account_id
+            JOIN market_accounts a ON a.user_id=r.id
+            WHERE l.community_id=:community AND l.community_user_id=:user AND l.account_id=:account AND l.active=TRUE
+            FOR UPDATE OF a""", {"community": community_id, "user": payload.community_user_id, "account": payload.account_id})
+        if not account:
+            raise HTTPException(status_code=404, detail="Ravenhood account link not found for this community")
+        campaign = one(connection, """SELECT p.*,s.ticker FROM market_promo_codes p
+            LEFT JOIN market_securities s ON s.id=p.security_id WHERE p.code_hash=:hash FOR UPDATE OF p""", {"hash": code_hash})
+        if not campaign or not bool(campaign["active"]) or (campaign.get("expires_at") and str(campaign["expires_at"]) <= now):
+            raise HTTPException(status_code=404, detail="This promotional code is invalid or no longer active")
+        if int(campaign["redemption_count"] or 0) >= int(campaign["max_redemptions"] or 0):
+            raise HTTPException(status_code=409, detail="This promotional campaign has reached its redemption limit")
+        if one(connection, "SELECT id FROM market_promo_redemptions WHERE promo_id=:promo AND account_id=:account", {"promo": campaign["id"], "account": account["id"]}):
+            raise HTTPException(status_code=409, detail="This account has already redeemed the campaign")
+        reward_type = str(campaign["reward_type"])
+        if reward_type == "cash":
+            amount = Decimal(str(campaign["cash_amount"] or 0))
+            execute(connection, "UPDATE market_accounts SET cash_balance=cash_balance+:amount,updated_at=:now WHERE id=:id", {"amount": amount, "now": now, "id": account["id"]})
+            summary = f"${amount:,.2f} Ravenhood buying power"
+        else:
+            if reward_type == "stock":
+                securities = all_rows(connection, """SELECT s.id,s.ticker FROM market_securities s
+                    WHERE s.id=:id AND s.active=1 AND s.lifecycle_status='active'
+                    AND NOT EXISTS (SELECT 1 FROM market_security_halts h WHERE h.security_id=s.id AND h.status='active')""", {"id": campaign["security_id"]})
+            else:
+                securities = all_rows(connection, """SELECT s.id,s.ticker FROM market_securities s
+                    WHERE s.active=1 AND s.lifecycle_status='active' AND s.security_type='stock'
+                    AND NOT EXISTS (SELECT 1 FROM market_security_halts h WHERE h.security_id=s.id AND h.status='active')
+                    ORDER BY RANDOM() LIMIT :limit""", {"limit": int(campaign["bundle_size"] or 0)})
+            if not securities:
+                raise HTTPException(status_code=409, detail="The securities assigned to this campaign are unavailable")
+            quantity = Decimal(str(campaign["share_quantity"] or 0))
+            for security in securities:
+                execute(connection, """INSERT INTO market_holdings (account_id,security_id,quantity,average_cost)
+                    VALUES (:account,:security,:quantity,0) ON CONFLICT (account_id,security_id)
+                    DO UPDATE SET quantity=market_holdings.quantity+EXCLUDED.quantity""", {"account": account["id"], "security": security["id"], "quantity": quantity})
+            summary = ", ".join(f"{quantity:g} {security['ticker']}" for security in securities)
+        execute(connection, """INSERT INTO market_promo_redemptions (promo_id,account_id,community_id,reward_summary,redeemed_at)
+            VALUES (:promo,:account,:community,:summary,:now)""", {"promo": campaign["id"], "account": account["id"], "community": community_id, "summary": summary, "now": now})
+        execute(connection, "UPDATE market_promo_codes SET redemption_count=redemption_count+1 WHERE id=:id", {"id": campaign["id"]})
+        audit(connection, actor_type="community", actor_id=community_id, actor_role="trade:write", action="promotion.redeemed",
+            target_type="ravenhood_account", target_id=payload.account_id, new={"campaign_id": campaign["id"], "reward": summary})
+    return {"ok": True, "campaign_name": campaign["campaign_name"], "reward_summary": summary}
 
 
 @router.get("/admin/investigations")

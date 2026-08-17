@@ -244,6 +244,40 @@ DDL = (
         FOREIGN KEY (security_id) REFERENCES market_securities(id) ON DELETE CASCADE,
         FOREIGN KEY (created_by) REFERENCES fcx_control_admin_users(id) ON DELETE SET NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS market_promo_codes (
+        id SERIAL PRIMARY KEY,
+        campaign_name TEXT NOT NULL,
+        code_hash TEXT NOT NULL UNIQUE,
+        code_hint TEXT NOT NULL,
+        code_plain TEXT NOT NULL DEFAULT '',
+        reward_type TEXT NOT NULL,
+        cash_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+        security_id INTEGER,
+        share_quantity NUMERIC(18,6) NOT NULL DEFAULT 0,
+        bundle_size INTEGER NOT NULL DEFAULT 0,
+        max_redemptions INTEGER NOT NULL DEFAULT 1,
+        redemption_count INTEGER NOT NULL DEFAULT 0,
+        expires_at TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_by BIGINT,
+        created_by_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (security_id) REFERENCES market_securities(id) ON DELETE SET NULL,
+        FOREIGN KEY (created_by) REFERENCES fcx_control_admin_users(id) ON DELETE SET NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS market_promo_redemptions (
+        id SERIAL PRIMARY KEY,
+        promo_id INTEGER NOT NULL,
+        account_id INTEGER NOT NULL,
+        community_id TEXT NOT NULL DEFAULT '',
+        reward_summary TEXT NOT NULL,
+        redeemed_at TEXT NOT NULL,
+        UNIQUE(promo_id,account_id),
+        FOREIGN KEY (promo_id) REFERENCES market_promo_codes(id) ON DELETE CASCADE,
+        FOREIGN KEY (account_id) REFERENCES market_accounts(id) ON DELETE CASCADE
+    )""",
+    """CREATE INDEX IF NOT EXISTS market_promo_redemptions_account_created_idx
+        ON market_promo_redemptions(account_id,redeemed_at DESC)""",
     """CREATE TABLE IF NOT EXISTS market_price_history (
         id SERIAL PRIMARY KEY,
         security_id INTEGER NOT NULL,

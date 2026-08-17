@@ -3,7 +3,7 @@ const state = { user: null, csrf: "", section: "overview", cache: new Map(), set
 const sections = [
   ["overview", "Overview"], ["engine", "FCX Engine"], ["operations", "Market Operations"], ["market", "Market"], ["companies", "Companies"],
   ["securities", "Securities"], ["orders", "Orders"], ["trades", "Trades"],
-  ["accounts", "Ravenhood Accounts"], ["banking", "FCX Banking"], ["investigations", "FEC Investigations"],
+  ["accounts", "Ravenhood Accounts"], ["promotions", "Account Promotions"], ["banking", "FCX Banking"], ["investigations", "FEC Investigations"],
   ["communities", "Communities"], ["connections", "API Connections"],
   ["leverage", "Leverage"], ["settings", "Market Settings"],
   ["audit", "Audit Log"], ["health", "System Health"],
@@ -14,7 +14,7 @@ function isDeveloper() { const roles = currentRoles(); return roles.has("super_a
 function visibleSections() {
   if (isDeveloper()) return sections;
   const roles = currentRoles();
-  if (roles.has("fec_admin")) return sections.filter(([key]) => ["overview", "operations", "market", "securities", "orders", "trades", "accounts", "banking", "investigations", "leverage", "audit", "health"].includes(key));
+  if (roles.has("fec_admin")) return sections.filter(([key]) => ["overview", "operations", "market", "securities", "orders", "trades", "accounts", "promotions", "banking", "investigations", "leverage", "audit", "health"].includes(key));
   if (roles.has("fcx_admin") || roles.has("commissioner")) return sections.filter(([key]) => !["investigations", "leverage", "settings"].includes(key));
   return sections.filter(([key]) => ["overview", "health"].includes(key));
 }
@@ -59,7 +59,7 @@ async function openSection(section, force = false) {
   renderNav();
   const label = sections.find(item => item[0] === section)?.[1] || "Control";
   $("#section-title").textContent = label;
-  $("#section-kicker").textContent = section === "investigations" ? "FEDERAL EXCHANGE COMMISSION" : "RAVENHOOD EXCHANGE OPERATIONS";
+  $("#section-kicker").textContent = ["investigations", "promotions"].includes(section) ? "FEDERAL EXCHANGE COMMISSION" : "RAVENHOOD EXCHANGE OPERATIONS";
   const content = $("#content");
   content.innerHTML = `<div class="empty">Synchronizing ${esc(label)}…</div>`;
   try {
@@ -310,6 +310,26 @@ async function renderLeverageLegacy() {
   return `${sectionHead("RISK ENGINE", "Leverage administration", "Central limits apply consistently to every connected CAD.")}<div class="grid"><article class="panel"><h4>Current risk posture</h4><p>Leverage is ${yes(settings.leverage_enabled) ? "enabled" : "disabled"}; the configured ceiling is ${esc(settings.max_leverage || "not set")}x.</p>${bars([Number(settings.max_leverage || 1), 10, 25, 50, 100])}</article><article class="panel"><h4>Change leverage controls</h4><form id="leverage-form" class="form-grid"><label>Enabled<select name="leverage_enabled"><option value="true" ${yes(settings.leverage_enabled) ? "selected" : ""}>Enabled</option><option value="false" ${!yes(settings.leverage_enabled) ? "selected" : ""}>Disabled</option></select></label><label>Maximum leverage<input type="number" name="max_leverage" min="1" max="200" step="1" value="${esc(settings.max_leverage || 5)}"></label><button class="primary full" type="submit">Save risk controls</button></form></article></div>`;
 }
 
+async function renderPromotions() {
+  const data = await cached("promotions", "/admin/fec/promotions");
+  const campaigns = data.campaigns || [], redemptions = data.redemptions || [], securities = data.securities || [];
+  const active = campaigns.filter(row => yes(row.active)).length;
+  const reward = row => row.reward_type === "cash" ? money(row.cash_amount) : row.reward_type === "stock" ? `${number(row.share_quantity)} ${esc(row.ticker || "shares")}` : `${number(row.bundle_size)} random stocks × ${number(row.share_quantity)}`;
+  return `${sectionHead("ACCOUNT PROMOTIONS", "Promotional Campaigns", "Issue and control portfolio rewards centrally for every connected CAD community. CAD owners cannot create these codes.")}
+    ${metrics([["Active campaigns", active, `${campaigns.length} total`], ["Total claims", campaigns.reduce((sum,row)=>sum+Number(row.redemption_count||0),0), "Cross-community"], ["Authority", "FEC ONLY", "Central issuance", "up"]])}
+    <div class="grid two"><form id="promotion-form" class="panel"><h4>Issue a promotional campaign</h4>
+      <label>Campaign name<input name="campaign_name" maxlength="120" required></label><label>Custom code<input name="custom_code" maxlength="32" placeholder="Generated securely when blank"></label>
+      <label>Reward type<select name="reward_type" id="promotion-reward"><option value="cash">Cash buying power</option><option value="stock">Selected stock</option><option value="random_bundle">Starter portfolio</option></select></label>
+      <label data-promotion-cash>Cash amount<input name="cash_amount" type="number" min="0.01" step="0.01" value="5000"></label>
+      <label data-promotion-stock hidden>Security<select name="security_id"><option value="">Select security</option>${selectOptions(securities)}</select></label>
+      <label data-promotion-shares hidden>Shares per security<input name="share_quantity" type="number" min="0.000001" step="0.000001" value="1"></label>
+      <label data-promotion-bundle hidden>Portfolio size<select name="bundle_size"><option value="3">3 stocks</option><option value="5">5 stocks</option><option value="9">9 stocks</option></select></label>
+      <label>Redemption limit<input name="max_redemptions" type="number" min="1" max="100000" value="100" required></label><label>Expires after (days)<input name="expiry_days" type="number" min="1" max="365" value="30" required></label>
+      <button type="submit">Issue promotional code</button><div id="promotion-secret"></div></form>
+      <article class="panel"><h4>Recent redemptions</h4>${redemptions.map(row=>`<div class="audit-entry"><time>${esc(stamp(row.redeemed_at))}</time><strong>${esc(row.campaign_name)}</strong><span>${esc(row.display_name)} · ${esc(row.community_id || "FCX")}<br><small>${esc(row.reward_summary)}</small></span></div>`).join("")||`<div class="empty">No codes redeemed.</div>`}</article></div>
+    ${dataTable(["Campaign","Reward","Claims","Expires","Control"],campaigns,row=>`<tr><td><strong>${esc(row.campaign_name)}</strong><small><code>${esc(row.code_plain)}</code> · ${esc(row.created_by_name)}</small></td><td>${reward(row)}</td><td>${number(row.redemption_count)} / ${number(row.max_redemptions)}</td><td>${esc(stamp(row.expires_at))}</td><td><button class="promotion-status" data-id="${row.id}" data-active="${yes(row.active)?0:1}">${yes(row.active)?"Pause":"Resume"}</button>${Number(row.redemption_count||0)?"":` <button class="promotion-delete danger" data-id="${row.id}">Delete</button>`}</td></tr>`,"No promotional campaigns issued.")}`;
+}
+
 async function renderLeverage() {
   const data = await cached("leverage", "/admin/leverage");
   const settings = Object.fromEntries((data.settings || []).map(row => [row.setting_key, row.setting_value]));
@@ -461,7 +481,7 @@ async function renderHealth() {
   return `<section class="hero"><span class="status-chip">Service healthy</span><h3>FCX is answering<br>for itself.</h3><p>The exchange database, authenticated control API, and standalone PWA are independent from CAD 1 and CAD 2.</p></section>${metrics([["Database", health.database, "Dedicated FCX connection", "up"], ["Communities", health.counts.communities, "Registry rows"], ["Pending settlements", health.counts.pending_settlements, "Awaiting terminal state"], ["Open cases", health.counts.open_investigations, "FEC docket"], ["Service", health.service, "API v1"], ["CAD dependency", "None", `${overview.communities.length} API clients`, "up"]])}`;
 }
 
-const renderers = { overview: renderOverview, engine: renderEngine, operations: renderOperations, market: renderMarket, companies: renderCompanies, securities: renderSecurities, orders: renderOrders, trades: renderTrades, accounts: renderAccounts, banking: renderBanking, investigations: renderInvestigations, communities: renderCommunities, connections: renderConnections, leverage: renderLeverage, settings: renderSettings, audit: renderAudit, health: renderHealth };
+const renderers = { overview: renderOverview, engine: renderEngine, operations: renderOperations, market: renderMarket, companies: renderCompanies, securities: renderSecurities, orders: renderOrders, trades: renderTrades, accounts: renderAccounts, promotions: renderPromotions, banking: renderBanking, investigations: renderInvestigations, communities: renderCommunities, connections: renderConnections, leverage: renderLeverage, settings: renderSettings, audit: renderAudit, health: renderHealth };
 
 function formBody(form) { return Object.fromEntries(new FormData(form)); }
 function optionalNumber(value) { return value === "" || value === null || value === undefined ? null : Number(value); }
@@ -476,6 +496,12 @@ async function mutation(path, method, body, message, section = state.section) {
 }
 
 function bindActions() {
+  const promotionReward = $("#promotion-reward");
+  const syncPromotionFields = () => { const reward = promotionReward?.value; if ($('[data-promotion-cash]')) $('[data-promotion-cash]').hidden = reward !== "cash"; if ($('[data-promotion-stock]')) $('[data-promotion-stock]').hidden = reward !== "stock"; if ($('[data-promotion-shares]')) $('[data-promotion-shares]').hidden = reward === "cash"; if ($('[data-promotion-bundle]')) $('[data-promotion-bundle]').hidden = reward !== "random_bundle"; };
+  promotionReward?.addEventListener("change", syncPromotionFields); syncPromotionFields();
+  $("#promotion-form")?.addEventListener("submit", async event => { event.preventDefault(); const raw=formBody(event.currentTarget); const body={...raw,cash_amount:Number(raw.cash_amount||0),security_id:optionalNumber(raw.security_id),share_quantity:Number(raw.share_quantity||0),bundle_size:Number(raw.bundle_size||0),max_redemptions:Number(raw.max_redemptions),expiry_days:Number(raw.expiry_days)}; try { const issued=await request("/admin/fec/promotions",{method:"POST",body}); state.cache.clear(); $("#promotion-secret").innerHTML=`<div class="secret"><strong>Copy this code now</strong><br>${esc(issued.code)}</div>`; notice("FEC promotional campaign issued."); } catch(error){notice(error.message,true);} });
+  document.querySelectorAll(".promotion-status").forEach(button=>button.addEventListener("click",()=>mutation(`/admin/fec/promotions/${button.dataset.id}`,"PATCH",{active:button.dataset.active==="1"},"Campaign status updated.","promotions")));
+  document.querySelectorAll(".promotion-delete").forEach(button=>button.addEventListener("click",()=>{if(confirm("Delete this unused promotional campaign?"))mutation(`/admin/fec/promotions/${button.dataset.id}`,"DELETE",undefined,"Campaign deleted.","promotions");}));
   const applySettlementFilter = filter => {
     state.settlementFilter = filter || "all";
     document.querySelectorAll(".settlement-filter").forEach(button => button.classList.toggle("active", button.dataset.filter === state.settlementFilter));
