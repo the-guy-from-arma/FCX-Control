@@ -37,6 +37,7 @@ from fcx_engine.service import (
 
 from .config import settings
 from .db import all_rows, execute, one, transaction
+from .indexes import market_cap_weights, rank_by_market_cap, security_market_cap
 from .security import (
     community_principal,
     create_session,
@@ -304,6 +305,38 @@ class SecurityMarginPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     margin_enabled: bool | None = None
     margin_max_leverage: Decimal | None = Field(default=None, ge=1, le=200)
+
+
+class IndexCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fund_key: str = Field(min_length=2, max_length=40)
+    ticker: str = Field(min_length=2, max_length=12)
+    display_name: str = Field(min_length=3, max_length=120)
+    description: str = Field(default="FCX market-cap weighted index.", max_length=1000)
+    target_size: int = Field(default=8, ge=1, le=50)
+    base_nav: Decimal = Field(default=Decimal("100"), ge=1, le=1_000_000)
+    management_fee_percent: Decimal = Field(default=Decimal("0"), ge=0, le=10)
+    auto_populate: bool = True
+
+    @field_validator("fund_key", "ticker")
+    @classmethod
+    def normalize_index_identifier(cls, value: str) -> str:
+        normalized = value.strip().upper().replace(" ", "_")
+        if not normalized or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in normalized):
+            raise ValueError("Use only letters, numbers, underscores, or hyphens")
+        return normalized
+
+
+class IndexMembersRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    security_ids: list[int] = Field(default_factory=list, max_length=100)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class IndexRebalanceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fund_ids: list[int] = Field(default_factory=list, max_length=100)
+    reason: str = Field(default="Automated market-cap restructure", min_length=3, max_length=1000)
 
 
 class PromotionCreateRequest(BaseModel):
@@ -1141,6 +1174,175 @@ def engine_dividend(payload: EngineDividendRequest, request: Request, user: dict
     with transaction() as connection:
         audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="engine.dividend.declared", target_type="security", target_id=payload.ticker.upper(), new=payload.model_dump(), request=request)
     return result
+
+
+def _eligible_index_securities(connection: Any) -> list[dict[str, Any]]:
+    rows = all_rows(connection, """SELECT id,ticker,name,sector,price,issued_shares,volatility,index_eligible
+        FROM market_securities
+        WHERE active=1 AND lifecycle_status='active' AND index_eligible=1
+          AND security_type<>'fund'
+        ORDER BY ticker""")
+    for row in rows:
+        row["market_cap"] = security_market_cap(row)
+    return rows
+
+
+def _index_admin_payload(connection: Any) -> dict[str, Any]:
+    funds = all_rows(connection, """SELECT f.*,s.ticker,s.name,s.description,s.price,s.previous_price,
+            s.issued_shares,(s.price*s.issued_shares) AS market_cap
+        FROM market_index_funds f JOIN market_securities s ON s.id=f.security_id
+        ORDER BY f.enabled DESC,f.fund_key""")
+    members = all_rows(connection, """SELECT m.fund_id,m.security_id,m.weight,m.score,m.reference_price,
+            m.market_cap_at_rebalance,m.realized_volatility,m.rank,m.added_at,
+            s.ticker,s.name,s.sector,s.price,s.issued_shares,
+            (s.price*s.issued_shares) AS current_market_cap
+        FROM market_index_members m JOIN market_securities s ON s.id=m.security_id
+        ORDER BY m.fund_id,m.rank,s.ticker""")
+    members_by_fund: dict[int, list[dict[str, Any]]] = {}
+    for member in members:
+        members_by_fund.setdefault(int(member["fund_id"]), []).append(member)
+    for fund in funds:
+        fund["members"] = members_by_fund.get(int(fund["id"]), [])
+    eligible = _eligible_index_securities(connection)
+    return {
+        "ok": True,
+        "funds": funds,
+        "eligible_securities": eligible,
+        "eligible_market_cap": sum((security_market_cap(row) for row in eligible), Decimal("0")),
+    }
+
+
+def _replace_index_members(
+    connection: Any,
+    fund: dict[str, Any],
+    securities: list[dict[str, Any]],
+    timestamp: str,
+    *,
+    update_target_size: bool,
+) -> list[dict[str, Any]]:
+    weights = market_cap_weights(securities)
+    execute(connection, "DELETE FROM market_index_members WHERE fund_id=:fund", {"fund": fund["id"]})
+    result: list[dict[str, Any]] = []
+    for rank, (security, weight) in enumerate(zip(securities, weights), start=1):
+        market_cap = security_market_cap(security)
+        execute(connection, """INSERT INTO market_index_members
+            (fund_id,security_id,weight,score,reference_price,market_cap_at_rebalance,realized_volatility,rank,added_at)
+            VALUES (:fund,:security,:weight,:score,:price,:market_cap,:volatility,:rank,:added)""", {
+                "fund": fund["id"], "security": security["id"], "weight": weight,
+                "score": market_cap, "price": security["price"], "market_cap": market_cap,
+                "volatility": security.get("volatility") or 0, "rank": rank, "added": timestamp,
+            })
+        result.append({"security_id": int(security["id"]), "ticker": security["ticker"], "weight": weight, "market_cap": market_cap, "rank": rank})
+    values = {"base_nav": fund.get("price") or fund.get("base_nav") or 100, "now": timestamp, "id": fund["id"], "size": len(securities)}
+    target_assignment = ",target_size=:size" if update_target_size else ""
+    execute(connection, f"""UPDATE market_index_funds SET base_nav=:base_nav,last_rebalanced_at=:now,
+        last_valued_at=:now,updated_at=:now{target_assignment} WHERE id=:id""", values)
+    return result
+
+
+@router.get("/admin/indexes")
+def index_settings(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        return _index_admin_payload(connection)
+
+
+@router.post("/admin/indexes")
+def create_index(payload: IndexCreateRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    timestamp = utcnow().isoformat()
+    with transaction() as connection:
+        if one(connection, "SELECT id FROM market_index_funds WHERE fund_key=:key", {"key": payload.fund_key}):
+            raise HTTPException(status_code=409, detail="That index key already exists")
+        if one(connection, "SELECT id FROM market_securities WHERE ticker=:ticker", {"ticker": payload.ticker}):
+            raise HTTPException(status_code=409, detail="That FCX ticker is already assigned")
+        security = one(connection, """INSERT INTO market_securities
+            (ticker,name,security_type,sector,description,price,previous_price,volatility,active,lifecycle_status,
+             issued_shares,index_eligible,margin_enabled,margin_max_leverage,updated_at)
+            VALUES (:ticker,:name,'fund','Index',:description,:nav,:nav,0.5,1,'active',1000000,0,0,1,:now)
+            RETURNING id,ticker,name,price""", {
+                "ticker": payload.ticker, "name": payload.display_name, "description": payload.description,
+                "nav": payload.base_nav, "now": timestamp,
+            })
+        if not security:
+            raise HTTPException(status_code=500, detail="FCX index security could not be created")
+        fund = one(connection, """INSERT INTO market_index_funds
+            (fund_key,security_id,display_name,risk_profile,target_size,base_nav,management_fee_percent,
+             enabled,rebalance_interval_hours,created_at,updated_at)
+            VALUES (:key,:security,:name,'market_cap',:size,:nav,:fee,1,24,:now,:now)
+            RETURNING *""", {
+                "key": payload.fund_key, "security": security["id"], "name": payload.display_name,
+                "size": payload.target_size, "nav": payload.base_nav,
+                "fee": payload.management_fee_percent, "now": timestamp,
+            })
+        selected: list[dict[str, Any]] = []
+        if fund and payload.auto_populate:
+            selected = rank_by_market_cap(_eligible_index_securities(connection), payload.target_size)
+            _replace_index_members(connection, {**fund, "price": security["price"]}, selected, timestamp, update_target_size=False)
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]),
+            action="market.index.created", target_type="market_index", target_id=str(fund["id"] if fund else ""),
+            new={**payload.model_dump(), "members": [row["ticker"] for row in selected]}, request=request)
+        response = _index_admin_payload(connection)
+    return {**response, "created_index_id": int(fund["id"] if fund else 0)}
+
+
+@router.put("/admin/indexes/{fund_id}/members")
+def replace_index_members(fund_id: int, payload: IndexMembersRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    timestamp = utcnow().isoformat()
+    security_ids = list(dict.fromkeys(int(value) for value in payload.security_ids))
+    if len(security_ids) != len(payload.security_ids):
+        raise HTTPException(status_code=400, detail="An index cannot contain the same security twice")
+    with transaction() as connection:
+        fund = one(connection, """SELECT f.*,s.ticker,s.price FROM market_index_funds f
+            JOIN market_securities s ON s.id=f.security_id WHERE f.id=:id AND f.enabled=1""", {"id": fund_id})
+        if not fund:
+            raise HTTPException(status_code=404, detail="Active FCX index not found")
+        previous = all_rows(connection, """SELECT m.security_id,s.ticker,m.weight,m.rank FROM market_index_members m
+            JOIN market_securities s ON s.id=m.security_id WHERE m.fund_id=:id ORDER BY m.rank""", {"id": fund_id})
+        selected: list[dict[str, Any]] = []
+        if security_ids:
+            rows = all_rows(connection, """SELECT id,ticker,name,sector,price,issued_shares,volatility FROM market_securities
+                WHERE id=ANY(CAST(:ids AS int[])) AND active=1 AND lifecycle_status='active'
+                  AND index_eligible=1 AND security_type<>'fund'""", {"ids": security_ids})
+            by_id = {int(row["id"]): row for row in rows}
+            if len(by_id) != len(security_ids):
+                raise HTTPException(status_code=409, detail="Every constituent must be an active, index-eligible company")
+            selected = [by_id[security_id] for security_id in security_ids]
+        changed = _replace_index_members(connection, fund, selected, timestamp, update_target_size=True)
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]),
+            action="market.index.members.replaced", target_type="market_index", target_id=str(fund_id),
+            previous={"members": previous}, new={"members": changed}, reason=payload.reason, request=request)
+        response = _index_admin_payload(connection)
+    return response
+
+
+@router.post("/admin/indexes/rebalance")
+def rebalance_indexes(payload: IndexRebalanceRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    timestamp = utcnow().isoformat()
+    fund_ids = list(dict.fromkeys(int(value) for value in payload.fund_ids))
+    with transaction() as connection:
+        values: dict[str, Any] = {}
+        where = " WHERE f.enabled=1"
+        if fund_ids:
+            where += " AND f.id=ANY(CAST(:ids AS int[]))"
+            values["ids"] = fund_ids
+        funds = all_rows(connection, f"""SELECT f.*,s.ticker,s.price FROM market_index_funds f
+            JOIN market_securities s ON s.id=f.security_id{where} ORDER BY f.fund_key""", values)
+        if fund_ids and len(funds) != len(fund_ids):
+            raise HTTPException(status_code=404, detail="One or more selected FCX indexes were not found")
+        if not funds:
+            raise HTTPException(status_code=409, detail="No enabled FCX indexes are available")
+        eligible = _eligible_index_securities(connection)
+        outcomes: list[dict[str, Any]] = []
+        for fund in funds:
+            previous = all_rows(connection, """SELECT s.ticker,m.weight,m.rank FROM market_index_members m
+                JOIN market_securities s ON s.id=m.security_id WHERE m.fund_id=:id ORDER BY m.rank""", {"id": fund["id"]})
+            selected = rank_by_market_cap(eligible, max(1, min(50, int(fund.get("target_size") or 8))))
+            changed = _replace_index_members(connection, fund, selected, timestamp, update_target_size=False)
+            audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]),
+                action="market.index.rebalanced_by_market_cap", target_type="market_index", target_id=str(fund["id"]),
+                previous={"members": previous}, new={"members": changed}, reason=payload.reason, request=request)
+            outcomes.append({"fund_id": int(fund["id"]), "ticker": fund["ticker"], "constituents": len(changed)})
+        response = _index_admin_payload(connection)
+    return {**response, "rebalanced": outcomes}
 
 
 @router.get("/admin/operations")
