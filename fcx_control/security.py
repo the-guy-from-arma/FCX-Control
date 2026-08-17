@@ -15,6 +15,7 @@ from fastapi import Header, HTTPException, Request
 
 from .config import settings
 from .db import execute, one, transaction
+from .roles import has_required_role
 
 
 PBKDF2_ROUNDS = 310_000
@@ -114,7 +115,7 @@ def require_roles(*allowed: str) -> Callable[[Request], dict[str, Any]]:
 
     def dependency(request: Request) -> dict[str, Any]:
         user = current_admin(request)
-        if "super_admin" not in user["roles"] and not required.intersection(user["roles"]):
+        if not has_required_role(user["roles"], required):
             raise HTTPException(status_code=403, detail="FCX role required")
         return user
 
@@ -133,7 +134,7 @@ def require_admin_csrf(*allowed: str) -> Callable[[Request, str], dict[str, Any]
 
     def dependency(request: Request, x_fcx_csrf: str = Header(default="")) -> dict[str, Any]:
         user = require_csrf(request, x_fcx_csrf)
-        if "super_admin" not in user["roles"] and not required.intersection(user["roles"]):
+        if not has_required_role(user["roles"], required):
             raise HTTPException(status_code=403, detail="FCX role required")
         return user
 
