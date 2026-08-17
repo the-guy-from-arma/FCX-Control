@@ -665,7 +665,11 @@ def account_profile(account_id: str, _: dict[str, Any] = Depends(require_roles(*
             COALESCE(SUM(realized_pnl) FILTER(WHERE status<>'open'),0) AS realized_pnl FROM market_margin_positions WHERE account_id=:id""", {"id": account["market_account_id"]}) if account.get("market_account_id") else {}
         recent = all_rows(connection, """SELECT o.created_at,s.ticker,o.side,o.quantity,o.unit_price,o.gross_amount,o.fee_amount
             FROM market_orders o JOIN market_securities s ON s.id=o.security_id WHERE o.account_id=:id ORDER BY o.created_at DESC LIMIT 20""", {"id": account["market_account_id"]}) if account.get("market_account_id") else []
-    return {"ok": True, "account": account, "holdings": holdings, "active_leverage": leverage, "stats": {**(stats or {}), **(margin_stats or {})}, "recent_activity": recent}
+        pending_orders = all_rows(connection, """SELECT tr.trade_request_id,tr.community_id,tr.side,tr.quantity,tr.submitted_price,
+            tr.estimated_total,tr.status,tr.created_at,tr.updated_at,s.ticker
+            FROM fcx_trade_requests tr JOIN market_securities s ON s.id=tr.security_id
+            WHERE tr.market_account_id=:id AND tr.status<>'SETTLED' ORDER BY tr.created_at DESC LIMIT 100""", {"id": account["market_account_id"]}) if account.get("market_account_id") else []
+    return {"ok": True, "account": account, "holdings": holdings, "active_leverage": leverage, "pending_orders": pending_orders, "stats": {**(stats or {}), **(margin_stats or {})}, "recent_activity": recent}
 
 
 @router.get("/admin/fec/promotions")
@@ -2641,8 +2645,6 @@ def _assert_market_access(connection: Any, principal: dict[str, Any], side: str)
         raise HTTPException(status_code=403, detail="FCX buying is disabled for this community")
     if side == "sell" and not principal.get("sell_enabled"):
         raise HTTPException(status_code=403, detail="FCX selling is disabled for this community")
-    if not _setting_enabled(connection, "market_open", True):
-        raise HTTPException(status_code=409, detail="FCX market is closed")
     if not _setting_enabled(connection, f"{side}_enabled", True):
         raise HTTPException(status_code=409, detail=f"FCX {side} orders are disabled")
     if _setting_enabled(connection, "maintenance_mode", False):
@@ -3098,6 +3100,13 @@ def community_portfolio(
                  AND tr.ravenhood_account_id=:account ORDER BY tr.created_at DESC LIMIT 200""",
             {"community": community_id, "user": community_user_id, "account": account_id},
         )
+        reserved_buying_power = one(connection, """SELECT COALESCE(SUM(estimated_total),0) AS total
+            FROM fcx_trade_requests WHERE market_account_id=:account AND side='buy'
+            AND status IN ('QUEUED','BANK_PENDING','BANK_RETRY_REQUIRED')""", {"account": account["market_account_id"]}) or {}
+        reserved = _money(reserved_buying_power.get("total") or 0)
+        account["settled_cash_balance"] = account.get("cash_balance") or 0
+        account["reserved_buying_power"] = reserved
+        account["available_buying_power"] = max(Decimal("0"), Decimal(str(account.get("cash_balance") or 0)) - reserved)
     return {"ok": True, "account": account, "holdings": holdings, "orders": orders}
 
 
@@ -3136,6 +3145,13 @@ def create_trade_order(
         fee = _money(gross * fee_percent / Decimal("100"))
         total = gross + fee if payload.side == "buy" else max(Decimal("0.01"), gross - fee)
         trade_request_id = "fcx_ord_" + secrets.token_urlsafe(18).replace("-", "").replace("_", "")
+        if payload.side == "buy":
+            reserved_row = one(connection, """SELECT COALESCE(SUM(estimated_total),0) AS total
+                FROM fcx_trade_requests WHERE market_account_id=:account AND side='buy'
+                AND status IN ('QUEUED','BANK_PENDING','BANK_RETRY_REQUIRED')""", {"account": account["market_account_id"]}) or {}
+            available_cash = Decimal(str(account.get("cash_balance") or 0)) - _money(reserved_row.get("total") or 0)
+            if available_cash < total:
+                raise HTTPException(status_code=409, detail=f"Insufficient unreserved buying power. Available: ${available_cash:,.2f}")
         if payload.side == "sell":
             holding = one(
                 connection,
@@ -3146,6 +3162,7 @@ def create_trade_order(
             if available < quantity:
                 raise HTTPException(status_code=409, detail="Insufficient available shares")
             execute(connection, "UPDATE market_holdings SET reserved_quantity=reserved_quantity+:quantity WHERE id=:id", {"quantity": quantity, "id": holding["id"]})
+        market_open = _setting_enabled(connection, "market_open", True)
         execute(
             connection,
             """INSERT INTO fcx_trade_requests
@@ -3154,14 +3171,17 @@ def create_trade_order(
                 submitted_price,estimated_gross,estimated_fee,estimated_total,status,
                 created_at,updated_at)
                VALUES (:request,:key,:community,:user,:ravenhood,:market_account,:security,
-                :side,:quantity,:price,:gross,:fee,:total,'CREATED',:now,:now)""",
-            {"request": trade_request_id, "key": payload.idempotency_key, "community": community_id, "user": payload.community_user_id, "ravenhood": payload.account_id, "market_account": account["market_account_id"], "security": security["id"], "side": payload.side, "quantity": quantity, "price": price, "gross": gross, "fee": fee, "total": total, "now": utcnow()},
+                :side,:quantity,:price,:gross,:fee,:total,:status,:now,:now)""",
+            {"request": trade_request_id, "key": payload.idempotency_key, "community": community_id, "user": payload.community_user_id, "ravenhood": payload.account_id, "market_account": account["market_account_id"], "security": security["id"], "side": payload.side, "quantity": quantity, "price": price, "gross": gross, "fee": fee, "total": total, "status": "CREATED" if market_open else "QUEUED", "now": utcnow()},
         )
         trade = _trade_response(connection, trade_request_id, community_id)
-        if payload.side == "buy":
+        if payload.side == "buy" and market_open:
             settlement_id = _create_trade_settlement(connection, trade=trade, operation="debit", amount=total)
             execute(connection, "UPDATE fcx_trade_requests SET status='BANK_PENDING',debit_settlement_id=:settlement,updated_at=NOW() WHERE trade_request_id=:request", {"settlement": settlement_id, "request": trade_request_id})
         audit(connection, actor_type="community", actor_id=community_id, action="trade.requested", target_type="trade_request", target_id=trade_request_id, new=payload.model_dump())
+    if not market_open:
+        with transaction() as connection:
+            return {"ok": True, "idempotent_replay": False, "trade": _trade_response(connection, trade_request_id, community_id)}
     if payload.side == "sell":
         settlement_id = _execute_sell_and_create_credit(trade_request_id, community_id)
     if not settlement_id:
@@ -3198,6 +3218,18 @@ def refresh_trade_order(
     community_id = str(principal["community_id"])
     with transaction() as connection:
         trade = _trade_response(connection, trade_request_id, community_id)
+    if str(trade["status"]) == "QUEUED":
+        with transaction() as connection:
+            if not _setting_enabled(connection, "market_open", True):
+                return {"ok": True, "trade": _trade_response(connection, trade_request_id, community_id)}
+            if str(trade["side"]) == "buy":
+                settlement_id = _create_trade_settlement(connection, trade=trade, operation="debit", amount=_money(trade["estimated_total"]))
+                execute(connection, "UPDATE fcx_trade_requests SET status='BANK_PENDING',debit_settlement_id=:settlement,updated_at=NOW() WHERE trade_request_id=:request", {"settlement": settlement_id, "request": trade_request_id})
+            else:
+                settlement_id = ""
+        if str(trade["side"]) == "sell":
+            settlement_id = _execute_sell_and_create_credit(trade_request_id, community_id)
+        trade = {**trade, "status": "BANK_PENDING" if str(trade["side"]) == "buy" else "PAYOUT_PENDING", "debit_settlement_id": settlement_id if str(trade["side"]) == "buy" else trade.get("debit_settlement_id"), "credit_settlement_id": settlement_id if str(trade["side"]) == "sell" else trade.get("credit_settlement_id")}
     if str(trade["status"]) != "SETTLED":
         settlement_id = str(trade.get("debit_settlement_id") or trade.get("credit_settlement_id") or "")
         if not settlement_id:
