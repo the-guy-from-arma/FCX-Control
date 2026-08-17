@@ -409,7 +409,9 @@ def logout(response: Response, user: dict[str, Any] = Depends(require_csrf)) -> 
 @router.get("/admin/overview")
 def overview(_: dict[str, Any] = Depends(require_roles(*ADMIN_ROLES, "fec_investigator"))) -> dict[str, Any]:
     with transaction() as connection:
-        communities = all_rows(connection, "SELECT * FROM fcx_communities ORDER BY community_name")
+        communities = all_rows(connection, """SELECT *,
+            (connection_enabled AND NOT suspended AND last_seen_at IS NOT NULL AND last_seen_at>=NOW()-INTERVAL '5 minutes') AS connected
+            FROM fcx_communities ORDER BY community_name""")
         totals = one(
             connection,
             """SELECT
@@ -418,7 +420,9 @@ def overview(_: dict[str, Any] = Depends(require_roles(*ADMIN_ROLES, "fec_invest
               (SELECT COALESCE(SUM(amount),0) FROM fcx_settlements WHERE state='SETTLED') AS settled_value,
               (SELECT COUNT(*) FROM fcx_investigations WHERE status='open') AS open_cases,
               (SELECT COUNT(*) FROM market_securities WHERE active=1 AND lifecycle_status='active') AS securities,
-              (SELECT COALESCE(SUM(price*issued_shares),0) FROM market_securities WHERE active=1 AND lifecycle_status='active') AS market_cap""",
+              (SELECT COALESCE(SUM(price*issued_shares),0) FROM market_securities WHERE active=1 AND lifecycle_status='active') AS market_cap,
+              (SELECT COUNT(*) FROM market_orders WHERE created_at::timestamptz>=NOW()-INTERVAL '1 hour') AS trades_last_hour,
+              (SELECT COALESCE(SUM(gross_amount),0) FROM market_orders WHERE created_at::timestamptz>=NOW()-INTERVAL '1 hour') AS volume_last_hour""",
         ) or {}
         recent = all_rows(connection, "SELECT * FROM fcx_audit_log ORDER BY id DESC LIMIT 25")
         settings_rows = all_rows(connection, "SELECT setting_key,setting_value FROM system_settings")
@@ -435,13 +439,17 @@ def overview(_: dict[str, Any] = Depends(require_roles(*ADMIN_ROLES, "fec_invest
             FROM fcx_engine_risk_flags WHERE status='open' ORDER BY last_seen_at DESC LIMIT 10""")
         active_companies = all_rows(connection, """SELECT id,ticker,name,price,previous_price,updated_at FROM market_securities
             WHERE active=1 AND lifecycle_status='active' ORDER BY ticker""")
+        recent_trades = all_rows(connection, """SELECT o.created_at,o.side,o.quantity,o.unit_price,o.gross_amount,
+            s.ticker,r.account_id,r.display_name FROM market_orders o JOIN market_securities s ON s.id=o.security_id
+            JOIN market_accounts a ON a.id=o.account_id JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+            ORDER BY o.created_at DESC LIMIT 12""")
     try:
         engine = engine_market_snapshot().get("engine", {})
     except Exception as exc:
         engine = {"error": type(exc).__name__, "settings": {"enabled": False}}
     return {"ok": True, "totals": totals, "communities": communities, "recent_actions": recent,
         "settings": settings_map, "live_positions": live_positions, "recent_alerts": recent_alerts,
-        "active_companies": active_companies, "engine": engine}
+        "active_companies": active_companies, "recent_trades": recent_trades, "engine": engine}
 
 
 @router.get("/admin/communities")
@@ -832,7 +840,9 @@ def system_health(_: dict[str, Any] = Depends(require_roles(*ADMIN_ROLES, "fec_i
     checked = utcnow()
     with transaction() as connection:
         one(connection, "SELECT 1 AS ok")
-        communities = all_rows(connection, "SELECT * FROM fcx_communities ORDER BY community_name")
+        communities = all_rows(connection, """SELECT *,
+            (connection_enabled AND NOT suspended AND last_seen_at IS NOT NULL AND last_seen_at>=NOW()-INTERVAL '5 minutes') AS connected
+            FROM fcx_communities ORDER BY community_name""")
         counts = one(connection, """SELECT (SELECT COUNT(*) FROM fcx_settlements WHERE state IN ('CREATED','BANK_AUTHORIZED','FAILED')) AS banking_backlog,
             (SELECT COUNT(*) FROM market_margin_positions WHERE status='open') AS open_leverage,
             (SELECT COUNT(*) FROM fcx_ravenhood_accounts WHERE status='active') AS active_accounts,

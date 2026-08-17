@@ -16,7 +16,7 @@
       <p class="eyebrow">RAVENHOOD / FEC CONTROL NETWORK</p>
       <h1>The exchange has its own front door.</h1>
       <p class="muted">Authorized commissioners, FEC investigators, and FCX operators only.</p>
-      <label>Email<input id="email" type="email" autocomplete="username" required></label>
+      <label>Email or investigator username<input id="email" type="text" autocomplete="username" required></label>
       <label>Password<input id="password" type="password" autocomplete="current-password" minlength="8" required></label>
       <button type="submit">Enter control platform</button>
       <p id="login-error" class="error" role="alert"></p>
@@ -25,15 +25,17 @@
 
   <div id="workspace" class="workspace" hidden>
     <aside class="rail">
-      <div><div class="brand-mark small">FCX</div><p class="eyebrow">CONTROL PLATFORM</p></div>
-      <nav id="nav"></nav>
-      <div class="rail-foot"><span class="signal"></span><span>Independent service</span><button id="logout">Log out</button></div>
+      <div class="rail-brand"><div class="brand-mark small">FCX</div><div><strong>FCX Control</strong><span>Federal Exchange Commission</span></div></div>
+      <div class="rail-context"><span class="signal"></span><div><strong>Control network online</strong><small>Independent FCX authority</small></div></div>
+      <nav id="nav" aria-label="FEC control navigation"></nav>
+      <div class="rail-foot"><div class="operator-card"><span class="operator-avatar" id="operator-avatar">FE</span><span><strong id="rail-operator-name">Authorized operator</strong><small id="rail-operator-role">FEC access</small></span></div><button id="logout">Sign out</button></div>
     </aside>
     <main>
       <header class="topbar">
-        <div><p class="eyebrow" id="section-kicker">EXCHANGE INTELLIGENCE</p><h2 id="section-title">Overview</h2></div>
-        <div class="operator"><span id="operator-name"></span><button id="refresh">Synchronize</button></div>
+        <div class="topbar-title"><button id="mobile-menu" class="icon-button" aria-label="Open navigation">☰</button><div><p class="eyebrow" id="section-kicker">EXCHANGE INTELLIGENCE</p><h2 id="section-title">Overview</h2></div></div>
+        <div class="operator"><span class="sync-state"><i></i><span>Live</span></span><span id="operator-name"></span><button id="refresh" class="icon-button" title="Synchronize data" aria-label="Synchronize data">↻</button></div>
       </header>
+      <div class="mobile-scrim" id="mobile-scrim" hidden></div>
       <div id="notice" class="notice" hidden></div>
       <section id="content" class="content"></section>
     </main>
@@ -41,4 +43,3 @@
   <script src="/control.js" defer></script>
 </body>
 </html>
-
