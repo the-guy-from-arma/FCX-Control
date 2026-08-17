@@ -38,6 +38,7 @@ from fcx_engine.service import (
 from .config import settings
 from .db import all_rows, execute, one, transaction
 from .indexes import market_cap_weights, rank_by_market_cap, security_market_cap
+from .roles import CONTROL_ROLE_CATALOG, assignable_control_roles
 from .security import (
     community_principal,
     create_session,
@@ -364,14 +365,15 @@ class PromotionRedeemRequest(BaseModel):
     code: str = Field(min_length=6, max_length=40)
 
 
-class InvestigatorCreateRequest(BaseModel):
+class ControlAccountCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     username: str = Field(min_length=3, max_length=120)
     password: str = Field(min_length=12, max_length=1024)
     confirm_password: str = Field(min_length=12, max_length=1024)
+    role: Literal["commissioner", "fec_admin", "fcx_admin", "fec_investigator"] = "fec_investigator"
 
 
-class InvestigatorAccessRequest(BaseModel):
+class ControlAccountAccessRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     active: bool
     reason: str = Field(default="", max_length=1000)
@@ -666,7 +668,7 @@ def account_profile(account_id: str, _: dict[str, Any] = Depends(require_roles(*
 
 
 @router.get("/admin/fec/promotions")
-def promotional_campaigns(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin"))) -> dict[str, Any]:
+def promotional_campaigns(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "commissioner"))) -> dict[str, Any]:
     with transaction() as connection:
         campaigns = all_rows(connection, """SELECT p.*,s.ticker,s.name AS security_name
             FROM market_promo_codes p LEFT JOIN market_securities s ON s.id=p.security_id
@@ -804,7 +806,7 @@ def redeem_promotional_campaign(payload: PromotionRedeemRequest, principal: dict
 
 
 @router.get("/admin/investigations")
-def investigations(limit: int = 200, _: dict[str, Any] = Depends(require_roles("developer", "fec_admin"))) -> dict[str, Any]:
+def investigations(limit: int = 200, _: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "commissioner"))) -> dict[str, Any]:
     safe_limit = min(max(limit, 1), 1000)
     with transaction() as connection:
         rows = all_rows(
@@ -822,7 +824,7 @@ def investigations(limit: int = 200, _: dict[str, Any] = Depends(require_roles("
 
 
 @router.get("/admin/investigations/accounts/{account_id}/history")
-def investigation_account_history(account_id: str, page: int = 1, page_size: int = 50, search: str = "", symbol: str = "", transaction_type: str = "", sort: Literal["asc", "desc"] = "desc", _: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "fec_investigator"))) -> dict[str, Any]:
+def investigation_account_history(account_id: str, page: int = 1, page_size: int = 50, search: str = "", symbol: str = "", transaction_type: str = "", sort: Literal["asc", "desc"] = "desc", _: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "commissioner", "fec_investigator"))) -> dict[str, Any]:
     page = max(1, page); page_size = max(10, min(page_size, 100)); offset = (page - 1) * page_size
     with transaction() as connection:
         account = one(connection, """SELECT r.account_id,r.display_name,r.status,a.id AS market_account_id,a.cash_balance,
@@ -851,7 +853,7 @@ def investigation_account_history(account_id: str, page: int = 1, page_size: int
 
 
 @router.get("/admin/investigations/accounts/{account_id}/analytics")
-def investigation_account_analytics(account_id: str, period: Literal["day", "week", "month", "year"] = "day", _: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "fec_investigator"))) -> dict[str, Any]:
+def investigation_account_analytics(account_id: str, period: Literal["day", "week", "month", "year"] = "day", _: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "commissioner", "fec_investigator"))) -> dict[str, Any]:
     interval = {"day": "1 day", "week": "7 days", "month": "30 days", "year": "365 days"}[period]
     with transaction() as connection:
         account = one(connection, """SELECT a.id FROM market_accounts a JOIN fcx_ravenhood_accounts r ON r.id=a.user_id WHERE r.account_id=:account""", {"account": account_id})
@@ -903,47 +905,69 @@ def system_health(_: dict[str, Any] = Depends(require_roles(*ADMIN_ROLES, "fec_i
 
 
 @router.get("/admin/fec/investigators")
-def list_investigators(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin"))) -> dict[str, Any]:
+def list_investigators(user: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "commissioner"))) -> dict[str, Any]:
     with transaction() as connection:
         rows = all_rows(connection, """SELECT u.id,u.email,u.display_name,u.roles_json,u.active,u.last_login_at,u.created_at,u.deleted_at,u.access_note,
             creator.display_name AS created_by_name FROM fcx_control_admin_users u LEFT JOIN fcx_control_admin_users creator ON creator.id=u.created_by
-            WHERE u.roles_json ? 'fec_investigator' ORDER BY u.created_at DESC""")
-    return {"ok": True, "investigators": rows}
+            WHERE u.roles_json ?| ARRAY['commissioner','fec_admin','fcx_admin','fec_investigator']
+              AND NOT (u.roles_json ? 'super_admin' OR u.roles_json ? 'developer')
+            ORDER BY u.created_at DESC""")
+    return {
+        "ok": True,
+        "accounts": rows,
+        "investigators": [row for row in rows if "fec_investigator" in (row.get("roles_json") or [])],
+        "role_catalog": list(CONTROL_ROLE_CATALOG),
+        "assignable_roles": assignable_control_roles(user.get("roles") or []),
+    }
 
 
 @router.post("/admin/fec/investigators", status_code=201)
-def create_investigator(payload: InvestigatorCreateRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+def create_investigator(payload: ControlAccountCreateRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
     if payload.password != payload.confirm_password: raise HTTPException(status_code=400, detail="Passwords do not match")
+    if payload.role not in assignable_control_roles(user.get("roles") or []):
+        raise HTTPException(status_code=403, detail="You cannot assign that FCX control role")
     username = payload.username.strip(); email = username.lower() if "@" in username else f"{username.lower()}@fec.local"
     with transaction() as connection:
-        if one(connection, "SELECT id FROM fcx_control_admin_users WHERE email=:email", {"email": email}): raise HTTPException(status_code=409, detail="Investigator username already exists")
+        if one(connection, "SELECT id FROM fcx_control_admin_users WHERE email=:email", {"email": email}): raise HTTPException(status_code=409, detail="Control account username already exists")
         created = one(connection, """INSERT INTO fcx_control_admin_users (email,display_name,password_hash,roles_json,active,created_by,created_at,updated_at)
-            VALUES (:email,:name,:password,'[\"fec_investigator\"]'::jsonb,TRUE,:actor,NOW(),NOW()) RETURNING id,email,display_name,active,created_at""",
-            {"email": email, "name": username, "password": hash_password(payload.password), "actor": user["id"]})
-        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.investigator.created", target_type="admin_user", target_id=str(created["id"]), new={"username": username, "roles": ["fec_investigator"]}, request=request)
-    return {"ok": True, "investigator": created}
+            VALUES (:email,:name,:password,CAST(:roles AS jsonb),TRUE,:actor,NOW(),NOW())
+            RETURNING id,email,display_name,roles_json,active,created_at""",
+            {"email": email, "name": username, "password": hash_password(payload.password), "roles": json.dumps([payload.role]), "actor": user["id"]})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="control.account.created", target_type="admin_user", target_id=str(created["id"]), new={"username": username, "roles": [payload.role]}, request=request)
+    return {"ok": True, "account": created, "investigator": created if payload.role == "fec_investigator" else None}
 
 
 @router.patch("/admin/fec/investigators/{investigator_id}")
-def update_investigator_access(investigator_id: int, payload: InvestigatorAccessRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+def update_investigator_access(investigator_id: int, payload: ControlAccountAccessRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    if investigator_id == int(user["id"]): raise HTTPException(status_code=409, detail="You cannot change your own access from this screen")
     with transaction() as connection:
-        existing = one(connection, "SELECT id,email,display_name,active,deleted_at FROM fcx_control_admin_users WHERE id=:id AND roles_json ? 'fec_investigator'", {"id": investigator_id})
-        if not existing: raise HTTPException(status_code=404, detail="FEC investigator not found")
-        if existing.get("deleted_at") and payload.active: raise HTTPException(status_code=409, detail="Deleted investigator accounts cannot be restored")
+        existing = one(connection, """SELECT id,email,display_name,roles_json,active,deleted_at FROM fcx_control_admin_users
+            WHERE id=:id AND roles_json ?| ARRAY['commissioner','fec_admin','fcx_admin','fec_investigator']
+              AND NOT (roles_json ? 'super_admin' OR roles_json ? 'developer')""", {"id": investigator_id})
+        if not existing: raise HTTPException(status_code=404, detail="Managed FCX control account not found")
+        target_roles = set(existing.get("roles_json") or [])
+        if not target_roles.intersection(assignable_control_roles(user.get("roles") or [])):
+            raise HTTPException(status_code=403, detail="You cannot manage that FCX control role")
+        if existing.get("deleted_at") and payload.active: raise HTTPException(status_code=409, detail="Deleted control accounts cannot be restored")
         execute(connection, "UPDATE fcx_control_admin_users SET active=:active,access_note=:reason,updated_at=NOW() WHERE id=:id", {"active": payload.active, "reason": payload.reason, "id": investigator_id})
         if not payload.active: execute(connection, "UPDATE fcx_control_admin_sessions SET revoked_at=NOW() WHERE user_id=:id AND revoked_at IS NULL", {"id": investigator_id})
-        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.investigator.restored" if payload.active else "fec.investigator.revoked", target_type="admin_user", target_id=str(investigator_id), previous=existing, new=payload.model_dump(), reason=payload.reason, request=request)
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="control.account.restored" if payload.active else "control.account.revoked", target_type="admin_user", target_id=str(investigator_id), previous=existing, new=payload.model_dump(), reason=payload.reason, request=request)
     return {"ok": True, "active": payload.active}
 
 
 @router.delete("/admin/fec/investigators/{investigator_id}")
 def delete_investigator(investigator_id: int, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    if investigator_id == int(user["id"]): raise HTTPException(status_code=409, detail="You cannot delete your own control account")
     with transaction() as connection:
-        existing = one(connection, "SELECT id,email,display_name,active FROM fcx_control_admin_users WHERE id=:id AND roles_json ? 'fec_investigator'", {"id": investigator_id})
-        if not existing: raise HTTPException(status_code=404, detail="FEC investigator not found")
+        existing = one(connection, """SELECT id,email,display_name,roles_json,active FROM fcx_control_admin_users
+            WHERE id=:id AND roles_json ?| ARRAY['commissioner','fec_admin','fcx_admin','fec_investigator']
+              AND NOT (roles_json ? 'super_admin' OR roles_json ? 'developer')""", {"id": investigator_id})
+        if not existing: raise HTTPException(status_code=404, detail="Managed FCX control account not found")
+        if not set(existing.get("roles_json") or []).intersection(assignable_control_roles(user.get("roles") or [])):
+            raise HTTPException(status_code=403, detail="You cannot manage that FCX control role")
         execute(connection, "UPDATE fcx_control_admin_users SET active=FALSE,deleted_at=NOW(),email='deleted+'||id||'@fec.invalid',updated_at=NOW() WHERE id=:id", {"id": investigator_id})
         execute(connection, "UPDATE fcx_control_admin_sessions SET revoked_at=NOW() WHERE user_id=:id AND revoked_at IS NULL", {"id": investigator_id})
-        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="fec.investigator.deleted", target_type="admin_user", target_id=str(investigator_id), previous=existing, new={"soft_deleted": True}, request=request)
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="control.account.deleted", target_type="admin_user", target_id=str(investigator_id), previous=existing, new={"soft_deleted": True}, request=request)
     return {"ok": True}
 
 
@@ -1027,7 +1051,7 @@ def update_market_settings(payload: MarketSettingsPatch, request: Request, user:
 
 
 @router.get("/admin/engine/snapshot")
-def engine_snapshot(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin"))) -> dict[str, Any]:
+def engine_snapshot(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "commissioner"))) -> dict[str, Any]:
     """Expose the FCX-owned engine only through the authenticated FEC session."""
     return engine_market_snapshot()
 
@@ -1241,7 +1265,7 @@ def _replace_index_members(
 
 
 @router.get("/admin/indexes")
-def index_settings(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin"))) -> dict[str, Any]:
+def index_settings(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "commissioner"))) -> dict[str, Any]:
     with transaction() as connection:
         return _index_admin_payload(connection)
 
@@ -1537,7 +1561,7 @@ def update_security_margin(
 
 
 @router.get("/admin/fec/workspace")
-def fec_workspace(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "fec_investigator"))) -> dict[str, Any]:
+def fec_workspace(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "commissioner", "fec_investigator"))) -> dict[str, Any]:
     with transaction() as connection:
         accounts = all_rows(connection, """SELECT r.id,r.account_id,r.display_name,r.status,r.restriction_reason,
             a.id AS market_account_id,a.cash_balance,a.status AS trading_status,
