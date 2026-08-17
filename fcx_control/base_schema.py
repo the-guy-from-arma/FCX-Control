@@ -133,6 +133,7 @@ DDL = (
         FOREIGN KEY (security_id) REFERENCES market_securities(id) ON DELETE CASCADE
     )""",
     """CREATE INDEX IF NOT EXISTS market_orders_created_idx ON market_orders(created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS market_orders_account_created_idx ON market_orders(account_id,created_at DESC)""",
     """CREATE TABLE IF NOT EXISTS market_order_requests (
         id SERIAL PRIMARY KEY,
         account_id INTEGER NOT NULL,
@@ -188,6 +189,8 @@ DDL = (
     )""",
     """CREATE INDEX IF NOT EXISTS market_margin_positions_open_idx
         ON market_margin_positions(status,security_id) WHERE status='open'""",
+    """CREATE INDEX IF NOT EXISTS market_margin_positions_account_status_idx
+        ON market_margin_positions(account_id,status,opened_at DESC)""",
     """CREATE TABLE IF NOT EXISTS market_margin_order_requests (
         id SERIAL PRIMARY KEY,
         account_id INTEGER NOT NULL,

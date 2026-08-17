@@ -220,3 +220,14 @@ td code { display: block; max-width: 360px; overflow-wrap: anywhere; color: #a8c
 .failure-detail { color: var(--red); }
 @media (max-width: 1120px) { .settlement-filter-grid { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 760px) { .settlement-filter-grid { grid-template-columns: repeat(2, 1fr); } .settlement-toolbar { align-items: stretch; flex-direction: column; } .settlement-toolbar button { width: 100%; } }
+.emergency-deck { border: 1px solid rgba(255,92,92,.35); background: linear-gradient(120deg,rgba(255,92,92,.10),rgba(7,21,27,.8)); padding: 16px; margin-bottom: 22px; }
+.account-stack { display: grid; gap: 10px; }
+.account-card { padding: 0; overflow: hidden; }
+.account-card summary { cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 18px; padding: 18px 20px; list-style: none; }
+.account-card summary::-webkit-details-marker { display: none; }
+.account-card summary span, .account-card summary strong, .account-card summary small { display: block; }
+.account-card summary small { margin-top: 4px; color: var(--muted); }
+.account-detail { border-top: 1px solid var(--line); padding: 20px; }
+.health-card h4 { font-size: 16px; }
+#investigation-account-result { margin: 14px 0 26px; }
+#engine-selected-count { float: right; color: var(--cyan); font-size: 11px; }

@@ -21,6 +21,9 @@ DDL = (
         created_at TIMESTAMPTZ NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL
     )""",
+    """ALTER TABLE fcx_control_admin_users ADD COLUMN IF NOT EXISTS created_by BIGINT""",
+    """ALTER TABLE fcx_control_admin_users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ""",
+    """ALTER TABLE fcx_control_admin_users ADD COLUMN IF NOT EXISTS access_note TEXT NOT NULL DEFAULT ''""",
     """CREATE TABLE IF NOT EXISTS fcx_control_admin_sessions (
         id BIGSERIAL PRIMARY KEY,
         user_id BIGINT NOT NULL,
@@ -190,6 +193,9 @@ DDL = (
         created_at TIMESTAMPTZ NOT NULL
     )""",
     """CREATE INDEX IF NOT EXISTS fcx_audit_log_created_idx ON fcx_audit_log(created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS fcx_ravenhood_links_account_community_idx ON fcx_ravenhood_links(account_id,community_id)""",
+    """CREATE INDEX IF NOT EXISTS fcx_settlements_account_created_idx ON fcx_settlements(account_id,created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS fcx_trade_requests_market_account_created_idx ON fcx_trade_requests(market_account_id,created_at DESC)""",
 )
 
 
