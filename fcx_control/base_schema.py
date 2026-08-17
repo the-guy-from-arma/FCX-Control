@@ -413,6 +413,35 @@ DDL = (
 def ensure_base_schema(db: Any) -> None:
     for statement in DDL:
         db.execute(statement)
+    # CAD 1 promotion tables predate the standalone FCX schema.  Databases
+    # created by the migration tool retain the legacy required ``user_id``
+    # column, while centralized redemption identifies the market account and
+    # community.  Make that table additive-compatible without deleting any
+    # migrated campaign or redemption history.
+    db.execute(
+        "ALTER TABLE market_promo_codes "
+        "ADD COLUMN IF NOT EXISTS created_by_name TEXT NOT NULL DEFAULT ''"
+    )
+    db.execute(
+        "ALTER TABLE market_promo_redemptions "
+        "ADD COLUMN IF NOT EXISTS community_id TEXT NOT NULL DEFAULT ''"
+    )
+    db.execute(
+        """DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='market_promo_redemptions'
+                  AND column_name='user_id'
+            ) THEN
+                ALTER TABLE market_promo_redemptions ALTER COLUMN user_id DROP NOT NULL;
+            END IF;
+        END $$"""
+    )
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS market_promo_redemptions_promo_account_idx "
+        "ON market_promo_redemptions(promo_id,account_id)"
+    )
     # Additive compatibility migration for databases first created by the
     # original monolith.  Reserved shares stop two communities (or two
     # retries) from selling the same position while a bank credit is pending.

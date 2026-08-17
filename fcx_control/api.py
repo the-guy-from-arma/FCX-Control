@@ -38,6 +38,7 @@ from fcx_engine.service import (
 from .config import settings
 from .db import all_rows, execute, one, transaction
 from .indexes import market_cap_weights, rank_by_market_cap, security_market_cap
+from .promotions import promotion_code_hashes
 from .roles import CONTROL_ROLE_CATALOG, assignable_control_roles
 from .security import (
     community_principal,
@@ -755,8 +756,7 @@ def delete_promotional_campaign(campaign_id: int, request: Request, user: dict[s
 @router.post("/community/promotions/redeem")
 def redeem_promotional_campaign(payload: PromotionRedeemRequest, principal: dict[str, Any] = Depends(require_community_scopes("trade:write"))) -> dict[str, Any]:
     community_id = str(principal["community_id"])
-    canonical = "".join(character for character in payload.code.upper() if character.isalnum())
-    code_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    code_hash, legacy_code_hash = promotion_code_hashes(payload.code)
     now = utcnow().isoformat()
     with transaction() as connection:
         account = one(connection, """SELECT a.id,a.status,r.account_id,r.display_name
@@ -767,7 +767,10 @@ def redeem_promotional_campaign(payload: PromotionRedeemRequest, principal: dict
         if not account:
             raise HTTPException(status_code=404, detail="Ravenhood account link not found for this community")
         campaign = one(connection, """SELECT p.*,s.ticker FROM market_promo_codes p
-            LEFT JOIN market_securities s ON s.id=p.security_id WHERE p.code_hash=:hash FOR UPDATE OF p""", {"hash": code_hash})
+            LEFT JOIN market_securities s ON s.id=p.security_id
+            WHERE p.code_hash=:hash OR p.code_hash=:legacy_hash
+            ORDER BY CASE WHEN p.code_hash=:hash THEN 0 ELSE 1 END LIMIT 1 FOR UPDATE OF p""",
+            {"hash": code_hash, "legacy_hash": legacy_code_hash})
         if not campaign or not bool(campaign["active"]) or (campaign.get("expires_at") and str(campaign["expires_at"]) <= now):
             raise HTTPException(status_code=404, detail="This promotional code is invalid or no longer active")
         if int(campaign["redemption_count"] or 0) >= int(campaign["max_redemptions"] or 0):
