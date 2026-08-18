@@ -654,7 +654,7 @@ def accounts(limit: int = 200, _: dict[str, Any] = Depends(require_roles(*ADMIN_
 
 
 @router.get("/admin/live-positions")
-def live_positions(community: str = "", ticker: str = "", account: str = "", side: str = "", outcome: str = "", limit: int = 500, _: dict[str, Any] = Depends(require_roles(*ADMIN_ROLES, "fec_investigator"))) -> dict[str, Any]:
+def live_positions(community: str = "", ticker: str = "", account: str = "", side: str = "", outcome: str = "", position_type: Literal["", "equity", "leverage"] = "", limit: int = 500, _: dict[str, Any] = Depends(require_roles(*ADMIN_ROLES, "fec_investigator"))) -> dict[str, Any]:
     clauses = ["p.status='open'"]
     values: dict[str, Any] = {"limit": max(1, min(limit, 1000))}
     if community: clauses.append("EXISTS(SELECT 1 FROM fcx_ravenhood_links fl WHERE fl.account_id=r.account_id AND fl.community_id=:community AND fl.active=TRUE)"); values["community"] = community
@@ -665,7 +665,7 @@ def live_positions(community: str = "", ticker: str = "", account: str = "", sid
     if outcome == "profitable": clauses.append(f"({pnl_sql})>=0")
     if outcome == "losing": clauses.append(f"({pnl_sql})<0")
     with transaction() as connection:
-        rows = all_rows(connection, f"""SELECT p.id,p.account_id AS market_account_id,p.direction AS side,p.leverage,p.quantity,p.entry_price,
+        leverage_rows = [] if position_type == "equity" else all_rows(connection, f"""SELECT p.id,p.account_id AS market_account_id,'leverage' AS position_type,p.direction AS side,p.leverage,p.quantity,p.entry_price,
             p.entry_notional,p.liquidation_price,p.opened_at,s.ticker,s.name,s.price AS current_price,r.account_id,r.display_name,
             COALESCE(STRING_AGG(DISTINCT l.community_id, ', '),'') AS communities,{pnl_sql} AS unrealized_pnl,
             p.quantity*s.price AS current_value,EXTRACT(EPOCH FROM (NOW()-p.opened_at::timestamptz)) AS age_seconds
@@ -673,7 +673,25 @@ def live_positions(community: str = "", ticker: str = "", account: str = "", sid
             JOIN market_accounts a ON a.id=p.account_id JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
             LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
             WHERE {' AND '.join(clauses)} GROUP BY p.id,s.id,r.id ORDER BY p.opened_at DESC LIMIT :limit""", values)
-    return {"ok": True, "positions": rows, "filters": {"community": community, "ticker": ticker, "account": account, "side": side, "outcome": outcome}}
+        equity_clauses = ["h.quantity>0"]
+        if community: equity_clauses.append("EXISTS(SELECT 1 FROM fcx_ravenhood_links fl WHERE fl.account_id=r.account_id AND fl.community_id=:community AND fl.active=TRUE)")
+        if ticker: equity_clauses.append("UPPER(s.ticker)=UPPER(:ticker)")
+        if account: equity_clauses.append("(r.account_id ILIKE :account OR r.display_name ILIKE :account)")
+        equity_pnl_sql = "(s.price-h.average_cost)*h.quantity"
+        if outcome == "profitable": equity_clauses.append(f"({equity_pnl_sql})>=0")
+        if outcome == "losing": equity_clauses.append(f"({equity_pnl_sql})<0")
+        equity_rows = [] if position_type == "leverage" or side == "short" else all_rows(connection, f"""SELECT ('holding-'||h.id)::text AS id,h.account_id AS market_account_id,
+            'equity' AS position_type,'long' AS side,1::numeric AS leverage,h.quantity,h.average_cost AS entry_price,
+            h.average_cost*h.quantity AS entry_notional,NULL::numeric AS liquidation_price,
+            COALESCE((SELECT MIN(o.created_at)::timestamptz FROM market_orders o WHERE o.account_id=h.account_id AND o.security_id=h.security_id AND o.side='buy'),a.created_at::timestamptz) AS opened_at,
+            s.ticker,s.name,s.price AS current_price,r.account_id,r.display_name,
+            COALESCE(STRING_AGG(DISTINCT l.community_id, ', '),'') AS communities,{equity_pnl_sql} AS unrealized_pnl,
+            h.quantity*s.price AS current_value,EXTRACT(EPOCH FROM (NOW()-COALESCE((SELECT MIN(o.created_at)::timestamptz FROM market_orders o WHERE o.account_id=h.account_id AND o.security_id=h.security_id AND o.side='buy'),a.created_at::timestamptz))) AS age_seconds
+            FROM market_holdings h JOIN market_securities s ON s.id=h.security_id JOIN market_accounts a ON a.id=h.account_id
+            JOIN fcx_ravenhood_accounts r ON r.id=a.user_id LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
+            WHERE {' AND '.join(equity_clauses)} GROUP BY h.id,s.id,a.id,r.id ORDER BY opened_at DESC LIMIT :limit""", values)
+    rows = sorted([*leverage_rows, *equity_rows], key=lambda row: _as_utc(row["opened_at"]), reverse=True)[:values["limit"]]
+    return {"ok": True, "positions": rows, "counts": {"equity": len(equity_rows), "leverage": len(leverage_rows)}, "filters": {"community": community, "ticker": ticker, "account": account, "side": side, "outcome": outcome, "position_type": position_type}}
 
 
 @router.post("/admin/live-positions/{position_id}/price")

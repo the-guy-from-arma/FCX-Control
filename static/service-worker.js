@@ -1,5 +1,5 @@
-const CACHE = "fcx-control-v5-alert-review";
-const CORE = ["/", "/control.css", "/control.js?v=alert-review-v5", "/manifest.webmanifest"];
+const CACHE = "fcx-control-v6-all-open-positions";
+const CORE = ["/", "/control.css", "/control.js?v=all-open-positions-v6", "/manifest.webmanifest"];
 self.addEventListener("install", event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(CORE)).then(() => self.skipWaiting())));
 self.addEventListener("activate", event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim())));
 self.addEventListener("fetch", event => {
