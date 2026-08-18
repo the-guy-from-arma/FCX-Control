@@ -1572,10 +1572,18 @@ def rebalance_indexes(payload: IndexRebalanceRequest, request: Request, user: di
 @router.get("/admin/operations")
 def market_operations(_: dict[str, Any] = Depends(require_roles("developer", "commissioner", "fcx_admin", "fec_admin"))) -> dict[str, Any]:
     with transaction() as connection:
-        securities = all_rows(connection, """SELECT s.*,
-            EXISTS(SELECT 1 FROM market_security_halts h WHERE h.security_id=s.id AND h.status='active') AS halted,
-            EXISTS(SELECT 1 FROM market_security_delistings d WHERE d.security_id=s.id AND d.status='active') AS delisted
-            FROM market_securities s WHERE s.active=1 AND s.lifecycle_status='active' ORDER BY s.ticker""")
+        securities = all_rows(connection, """SELECT s.*,h.id AS active_halt_id,h.reason_code AS halt_reason_code,
+            h.reason_label AS halt_reason_label,h.public_notice AS halt_public_notice,h.case_reference AS halt_case_reference,h.halted_at,
+            d.id AS active_delisting_id,d.reason_code AS delisting_reason_code,d.reason_label AS delisting_reason_label,
+            d.public_notice AS delisting_public_notice,d.case_reference AS delisting_case_reference,d.delisted_at,
+            (h.id IS NOT NULL) AS halted,(d.id IS NOT NULL) AS delisted,
+            CASE WHEN d.id IS NOT NULL OR s.lifecycle_status='delisted' THEN 'delisted'
+                 WHEN h.id IS NOT NULL THEN 'halted'
+                 WHEN s.active=1 AND s.lifecycle_status='active' THEN 'active' ELSE 'inactive' END AS exchange_status
+            FROM market_securities s
+            LEFT JOIN LATERAL (SELECT * FROM market_security_halts WHERE security_id=s.id AND status='active' ORDER BY id DESC LIMIT 1) h ON TRUE
+            LEFT JOIN LATERAL (SELECT * FROM market_security_delistings WHERE security_id=s.id AND status='active' ORDER BY id DESC LIMIT 1) d ON TRUE
+            ORDER BY CASE WHEN d.id IS NOT NULL OR s.lifecycle_status='delisted' THEN 3 WHEN h.id IS NOT NULL THEN 2 WHEN s.active=1 THEN 1 ELSE 4 END,s.ticker""")
         programs = all_rows(connection, """SELECT p.*,s.ticker,s.name FROM market_price_programs p
             LEFT JOIN market_securities s ON s.id=p.security_id ORDER BY p.id DESC LIMIT 500""")
         halts = all_rows(connection, """SELECT h.*,s.ticker,s.name FROM market_security_halts h
