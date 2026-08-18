@@ -195,6 +195,12 @@ class MarginOrderRequest(BaseModel):
     leverage: Decimal = Field(ge=1, le=200)
 
 
+class PositionPriceInterventionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target_price: Decimal = Field(gt=0, le=1_000_000_000, max_digits=18, decimal_places=4)
+    reason: str = Field(min_length=10, max_length=1000)
+
+
 class InvestigationRequest(BaseModel):
     account_id: str = Field(min_length=4, max_length=200)
     summary: str = Field(min_length=10, max_length=4000)
@@ -652,6 +658,44 @@ def live_positions(community: str = "", ticker: str = "", account: str = "", sid
             LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
             WHERE {' AND '.join(clauses)} GROUP BY p.id,s.id,r.id ORDER BY p.opened_at DESC LIMIT :limit""", values)
     return {"ok": True, "positions": rows, "filters": {"community": community, "ticker": ticker, "account": account, "side": side, "outcome": outcome}}
+
+
+@router.post("/admin/live-positions/{position_id}/price")
+def intervene_position_price(
+    position_id: int,
+    payload: PositionPriceInterventionRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin")),
+) -> dict[str, Any]:
+    target_price = payload.target_price.quantize(Decimal("0.0001"))
+    now = utcnow().isoformat()
+    with transaction() as connection:
+        position = one(connection, """SELECT p.id,p.status,p.direction,p.entry_price,p.liquidation_price,p.account_id,
+            s.id AS security_id,s.ticker,s.name,s.price AS current_price,r.account_id AS ravenhood_account_id,r.display_name
+            FROM market_margin_positions p JOIN market_securities s ON s.id=p.security_id
+            JOIN market_accounts a ON a.id=p.account_id JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+            WHERE p.id=:id FOR UPDATE OF p,s""", {"id": position_id})
+        if not position:
+            raise HTTPException(status_code=404, detail="Leveraged position not found")
+        if position["status"] != "open":
+            raise HTTPException(status_code=409, detail="Leveraged position is no longer open")
+        current_price = Decimal(str(position["current_price"]))
+        if target_price == current_price:
+            raise HTTPException(status_code=409, detail="Target price must differ from the current market price")
+        execute(connection, """UPDATE market_securities SET previous_price=price,price=:price,updated_at=:now
+            WHERE id=:security_id""", {"price": target_price, "now": now, "security_id": position["security_id"]})
+        execute(connection, """INSERT INTO market_price_history (security_id,price,source,recorded_at)
+            VALUES (:security_id,:price,'fec_position_intervention',:now)""",
+            {"security_id": position["security_id"], "price": target_price, "now": now})
+        change_percent = ((target_price / current_price - Decimal("1")) * Decimal("100")).quantize(Decimal("0.0001"))
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]),
+            action="fec.position_price.intervened", target_type="margin_position", target_id=str(position_id),
+            previous={"ticker": position["ticker"], "market_price": current_price, "position": position},
+            new={"ticker": position["ticker"], "market_price": target_price, "change_percent": change_percent,
+                 "affects_all_accounts": True}, reason=payload.reason, request=request)
+    return {"ok": True, "position_id": position_id, "ticker": position["ticker"],
+            "previous_price": current_price, "target_price": target_price, "change_percent": change_percent,
+            "affects_all_accounts": True}
 
 
 @router.get("/admin/accounts/{account_id}/profile")
