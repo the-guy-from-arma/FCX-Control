@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from market_math import ravenhood_margin_metrics, ravenhood_margin_quote
 
 from fcx_engine.service import (
     CycleRequest as EngineCycleRequest,
@@ -177,6 +178,16 @@ class SettlementBulkAction(BaseModel):
 class TradeOrderRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     idempotency_key: str = Field(min_length=8, max_length=200)
+
+
+class MarginOrderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    community_user_id: str = Field(min_length=1, max_length=200)
+    account_id: str = Field(min_length=3, max_length=120)
+    ticker: str = Field(min_length=1, max_length=12)
+    direction: Literal["long", "short"]
+    collateral: Decimal = Field(ge=10)
+    leverage: Decimal = Field(ge=1, le=200)
     community_user_id: str = Field(min_length=1, max_length=200)
     account_id: str = Field(min_length=4, max_length=200)
     ticker: str = Field(pattern=r"^[A-Za-z0-9._-]{1,16}$")
@@ -2962,7 +2973,7 @@ def community_market(
         securities = all_rows(
             connection,
             """SELECT s.id,s.ticker,s.name,s.security_type,s.sector,s.description,s.price,
-                      s.previous_price,s.volatility,s.issued_shares,
+                      s.previous_price,s.volatility,s.issued_shares,s.margin_enabled,s.margin_max_leverage,
                       ROUND(s.price*s.issued_shares,2) AS market_cap,s.updated_at,
                       EXISTS(SELECT 1 FROM market_security_halts h WHERE h.security_id=s.id AND h.status='active') AS halted
                FROM market_securities s
@@ -2970,7 +2981,7 @@ def community_market(
                  AND NOT EXISTS(SELECT 1 FROM market_security_delistings d WHERE d.security_id=s.id AND d.status='active')
                ORDER BY s.ticker""",
         )
-        settings_rows = all_rows(connection, "SELECT setting_key,setting_value FROM system_settings WHERE setting_key IN ('market_open','buy_enabled','sell_enabled','maintenance_mode')")
+        settings_rows = all_rows(connection, "SELECT setting_key,setting_value FROM system_settings WHERE setting_key IN ('market_open','buy_enabled','sell_enabled','maintenance_mode','market_margin_enabled','market_margin_maintenance_percent','market_margin_max_open_positions','market_margin_max_account_notional','market_trade_fee_percent')")
         raw_trade_tape = all_rows(
             connection,
             """SELECT t.id,s.ticker,s.name AS security_name,t.buy_volume,t.sell_volume,
@@ -3097,7 +3108,7 @@ def community_market(
     return {
         "ok": True,
         "community_id": principal["community_id"],
-        "permissions": {"trading": principal["trading_enabled"], "buy": principal["buy_enabled"], "sell": principal["sell_enabled"]},
+        "permissions": {"trading": principal["trading_enabled"], "buy": principal["buy_enabled"], "sell": principal["sell_enabled"], "margin": principal["trading_enabled"]},
         "market": {row["setting_key"]: row["setting_value"] for row in settings_rows},
         "history_range": normalized_range,
         "history_range_start": history_since,
@@ -3148,6 +3159,12 @@ def community_portfolio(
                  AND tr.ravenhood_account_id=:account ORDER BY tr.created_at DESC LIMIT 200""",
             {"community": community_id, "user": community_user_id, "account": account_id},
         )
+        margin_positions = all_rows(connection, """SELECT p.*,s.ticker,s.name,s.price AS mark_price,
+            CASE WHEN p.direction='short' THEN (p.entry_price-s.price)*p.quantity ELSE (s.price-p.entry_price)*p.quantity END AS unrealized_pnl
+            FROM market_margin_positions p JOIN market_securities s ON s.id=p.security_id
+            WHERE p.account_id=:account ORDER BY CASE WHEN p.status='open' THEN 0 ELSE 1 END,p.opened_at DESC LIMIT 200""", {"account": account["market_account_id"]})
+        margin_orders = all_rows(connection, """SELECT q.*,s.ticker,s.name FROM market_margin_order_requests q
+            JOIN market_securities s ON s.id=q.security_id WHERE q.account_id=:account ORDER BY q.id DESC LIMIT 200""", {"account": account["market_account_id"]})
         reserved_buying_power = one(connection, """SELECT COALESCE(SUM(estimated_total),0) AS total
             FROM fcx_trade_requests WHERE market_account_id=:account AND side='buy'
             AND status IN ('QUEUED','BANK_PENDING','BANK_RETRY_REQUIRED')""", {"account": account["market_account_id"]}) or {}
@@ -3155,7 +3172,70 @@ def community_portfolio(
         account["settled_cash_balance"] = account.get("cash_balance") or 0
         account["reserved_buying_power"] = reserved
         account["available_buying_power"] = max(Decimal("0"), Decimal(str(account.get("cash_balance") or 0)) - reserved)
-    return {"ok": True, "account": account, "holdings": holdings, "orders": orders}
+    return {"ok": True, "account": account, "holdings": holdings, "orders": orders, "margin_positions": margin_positions, "margin_orders": margin_orders}
+
+
+@router.post("/community/margin/orders")
+def create_margin_order(payload: MarginOrderRequest, request: Request, principal: dict[str, Any] = Depends(require_community_scopes("trade:write"))) -> dict[str, Any]:
+    community_id = str(principal["community_id"])
+    with transaction() as connection:
+        if not principal["trading_enabled"] or not _setting_enabled(connection, "market_margin_enabled", True):
+            raise HTTPException(status_code=409, detail="Community longs and shorts are restricted by FEC")
+        if not _setting_enabled(connection, "market_open", True):
+            raise HTTPException(status_code=409, detail="Leveraged positions are held while Ravenhood is closed")
+        account = _linked_market_account(connection, community_id=community_id, community_user_id=payload.community_user_id,
+            account_id=payload.account_id, lock=True, restriction_lane="leverage")
+        security = _security_for_trade(connection, payload.ticker.upper(), side="buy", lock=True)
+        if not int(security.get("margin_enabled") or 0):
+            raise HTTPException(status_code=409, detail="Margin trading is disabled for this security")
+        max_leverage = Decimal(str(security.get("margin_max_leverage") or 5))
+        if payload.leverage < 5 or payload.leverage > max_leverage:
+            raise HTTPException(status_code=400, detail=f"This security allows leverage from 5x through {max_leverage:g}x")
+        open_count = one(connection, "SELECT COUNT(*) AS total FROM market_margin_positions WHERE account_id=:id AND status='open'", {"id": account["market_account_id"]}) or {}
+        max_positions = int(_setting_decimal(connection, "market_margin_max_open_positions", "5"))
+        if int(open_count.get("total") or 0) >= max_positions:
+            raise HTTPException(status_code=409, detail=f"This account already has the maximum {max_positions} open margin positions")
+        fee_percent = _setting_decimal(connection, "market_trade_fee_percent", "0")
+        maintenance = _setting_decimal(connection, "market_margin_maintenance_percent", "20") / Decimal("100")
+        quote = ravenhood_margin_quote(payload.direction, security["price"], payload.collateral, payload.leverage, fee_percent, maintenance)
+        exposure = one(connection, "SELECT COALESCE(SUM(entry_notional),0) AS total FROM market_margin_positions WHERE account_id=:id AND status='open'", {"id": account["market_account_id"]}) or {}
+        max_notional = _setting_decimal(connection, "market_margin_max_account_notional", "100000000")
+        if Decimal(str(exposure.get("total") or 0)) + Decimal(str(quote["notional"])) > max_notional:
+            raise HTTPException(status_code=409, detail=f"This position would exceed the account margin exposure limit of ${max_notional:,.2f}")
+        opening_cost = _money(payload.collateral + Decimal(str(quote["open_fee"])))
+        if Decimal(str(account.get("cash_balance") or 0)) < opening_cost:
+            raise HTTPException(status_code=409, detail=f"Insufficient buying power. Collateral and fee require ${opening_cost:,.2f}")
+        opened_at = utcnow().isoformat()
+        execute(connection, "UPDATE market_accounts SET cash_balance=cash_balance-:cost,updated_at=NOW() WHERE id=:id", {"cost": opening_cost, "id": account["market_account_id"]})
+        position = one(connection, """INSERT INTO market_margin_positions
+            (account_id,security_id,direction,leverage,collateral,quantity,entry_price,entry_notional,open_fee,liquidation_price,status,opened_at)
+            VALUES (:account,:security,:direction,:leverage,:collateral,:quantity,:price,:notional,:fee,:liquidation,'open',:opened) RETURNING id""",
+            {"account": account["market_account_id"], "security": security["id"], "direction": payload.direction, "leverage": payload.leverage,
+             "collateral": payload.collateral, "quantity": quote["quantity"], "price": security["price"], "notional": quote["notional"],
+             "fee": quote["open_fee"], "liquidation": quote["liquidation_price"], "opened": opened_at})
+        audit(connection, actor_type="community", actor_id=community_id, action="margin.position.opened", target_type="margin_position", target_id=str(position["id"]), new=payload.model_dump(), request=request)
+    return {"ok": True, "status": "opened", "position_id": position["id"], **quote}
+
+
+@router.post("/community/margin/positions/{position_id}/close")
+def close_margin_position(position_id: int, community_user_id: str, account_id: str, request: Request, principal: dict[str, Any] = Depends(require_community_scopes("trade:write"))) -> dict[str, Any]:
+    community_id = str(principal["community_id"])
+    with transaction() as connection:
+        account = _linked_market_account(connection, community_id=community_id, community_user_id=community_user_id, account_id=account_id, lock=True, enforce_restrictions=False)
+        position = one(connection, """SELECT p.*,s.ticker,s.price AS mark_price FROM market_margin_positions p
+            JOIN market_securities s ON s.id=p.security_id WHERE p.id=:id AND p.account_id=:account FOR UPDATE OF p,s""", {"id": position_id, "account": account["market_account_id"]})
+        if not position: raise HTTPException(status_code=404, detail="Margin position was not found")
+        if str(position.get("status")) != "open": raise HTTPException(status_code=409, detail="This margin position is already closed")
+        fee_percent = _setting_decimal(connection, "market_trade_fee_percent", "0")
+        maintenance = _setting_decimal(connection, "market_margin_maintenance_percent", "20") / Decimal("100")
+        metrics = ravenhood_margin_metrics(position["direction"], position["entry_price"], position["mark_price"], position["quantity"], position["collateral"], position["leverage"], fee_percent, maintenance)
+        payout = _money(metrics["estimated_payout"]); closed_at = utcnow().isoformat()
+        execute(connection, "UPDATE market_accounts SET cash_balance=cash_balance+:payout,updated_at=NOW() WHERE id=:id", {"payout": payout, "id": account["market_account_id"]})
+        execute(connection, """UPDATE market_margin_positions SET status='closed',close_price=:price,close_notional=:notional,close_fee=:fee,
+            realized_pnl=:pnl,payout_amount=:payout,settlement_status='completed',settled_at=:closed,close_reason='resident_close',closed_at=:closed WHERE id=:id""",
+            {"price": metrics["mark_price"], "notional": metrics["close_notional"], "fee": metrics["close_fee"], "pnl": metrics["unrealized_pnl"], "payout": payout, "closed": closed_at, "id": position_id})
+        audit(connection, actor_type="community", actor_id=community_id, action="margin.position.closed", target_type="margin_position", target_id=str(position_id), new={"payout": str(payout)}, request=request)
+    return {"ok": True, "status": "closed", "position_id": position_id, "payout_amount": payout, **metrics}
 
 
 @router.post("/community/orders")
