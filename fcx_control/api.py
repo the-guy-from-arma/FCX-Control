@@ -3078,7 +3078,9 @@ def community_market(
             """SELECT f.id,f.fund_key,f.display_name,f.risk_profile,f.target_size,
                       f.base_nav,f.management_fee_percent,f.last_rebalanced_at,
                       f.last_valued_at,s.ticker,s.price,s.previous_price,
-                      (SELECT COUNT(*) FROM market_index_members m WHERE m.fund_id=f.id) AS constituent_count
+                      (SELECT COUNT(*) FROM market_index_members m WHERE m.fund_id=f.id) AS constituent_count,
+                      COALESCE((SELECT SUM(ms.price*ms.issued_shares) FROM market_index_members m
+                          JOIN market_securities ms ON ms.id=m.security_id WHERE m.fund_id=f.id),0) AS market_cap
                FROM market_index_funds f
                JOIN market_securities s ON s.id=f.security_id
                WHERE f.enabled=1 ORDER BY f.fund_key""",
@@ -3086,7 +3088,8 @@ def community_market(
         member_rows = all_rows(
             connection,
             """SELECT m.fund_id,s.ticker,s.name,m.weight,m.rank,m.reference_price,
-                      m.market_cap_at_rebalance,m.realized_volatility
+                      m.market_cap_at_rebalance,m.realized_volatility,
+                      ROUND(s.price*s.issued_shares,2) AS market_cap
                FROM market_index_members m
                JOIN market_securities s ON s.id=m.security_id
                ORDER BY m.fund_id,m.rank,s.ticker""",
@@ -3121,7 +3124,15 @@ def community_market(
         fund_id = int(row.pop("fund_id"))
         members_by_fund.setdefault(fund_id, []).append(row)
     for fund in index_funds:
-        fund["members"] = members_by_fund.get(int(fund["id"]), [])
+        constituents = members_by_fund.get(int(fund["id"]), [])
+        current_price = Decimal(str(fund.get("price") or 0))
+        previous_price = Decimal(str(fund.get("previous_price") or current_price))
+        fund["change_percent"] = (
+            ((current_price - previous_price) / previous_price) * Decimal("100")
+            if previous_price > 0 else Decimal("0")
+        ).quantize(Decimal("0.01"))
+        fund["constituents"] = constituents
+        fund["members"] = constituents
     trade_tape: list[dict[str, Any]] = []
     for raw in raw_trade_tape:
         source = str(raw.get("source") or "market").lower()
