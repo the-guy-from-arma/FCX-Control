@@ -178,6 +178,11 @@ class SettlementBulkAction(BaseModel):
 class TradeOrderRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     idempotency_key: str = Field(min_length=8, max_length=200)
+    community_user_id: str = Field(min_length=1, max_length=200)
+    account_id: str = Field(min_length=4, max_length=200)
+    ticker: str = Field(pattern=r"^[A-Za-z0-9._-]{1,16}$")
+    side: Literal["buy", "sell"]
+    quantity: Decimal = Field(gt=0, max_digits=24, decimal_places=8)
 
 
 class MarginOrderRequest(BaseModel):
@@ -188,11 +193,6 @@ class MarginOrderRequest(BaseModel):
     direction: Literal["long", "short"]
     collateral: Decimal = Field(ge=10)
     leverage: Decimal = Field(ge=1, le=200)
-    community_user_id: str = Field(min_length=1, max_length=200)
-    account_id: str = Field(min_length=4, max_length=200)
-    ticker: str = Field(pattern=r"^[A-Za-z0-9._-]{1,16}$")
-    side: Literal["buy", "sell"]
-    quantity: Decimal = Field(gt=0, max_digits=24, decimal_places=8)
 
 
 class InvestigationRequest(BaseModel):
