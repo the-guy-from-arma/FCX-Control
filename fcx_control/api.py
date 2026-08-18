@@ -215,6 +215,15 @@ class InvestigationPatch(BaseModel):
     notes_json: list[dict[str, Any]] | None = None
 
 
+class ProfitSurveillancePatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
+    gain_threshold: Decimal = Field(ge=1, le=1_000_000_000_000_000)
+    window_hours: int = Field(ge=1, le=8760)
+    include_unrealized: bool = True
+    auto_restrict: bool = True
+
+
 class MarketSettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     market_open: bool | None = None
@@ -885,6 +894,86 @@ def investigations(limit: int = 200, _: dict[str, Any] = Depends(require_roles("
     return {"ok": True, "investigations": rows}
 
 
+def _as_utc(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def _equity_pnl_ledger(connection: Any, market_account_id: int) -> list[dict[str, Any]]:
+    """Reconstruct weighted-cost equity P/L so every buy and sell has an auditable contribution."""
+    orders = all_rows(connection, """SELECT o.id,o.security_id,o.side,o.quantity,o.unit_price,o.gross_amount,o.fee_amount,
+        o.created_at AS occurred_at,s.ticker,s.name FROM market_orders o JOIN market_securities s ON s.id=o.security_id
+        WHERE o.account_id=:account ORDER BY o.created_at ASC,o.id ASC""", {"account": market_account_id})
+    positions: dict[int, tuple[Decimal, Decimal]] = {}
+    result: list[dict[str, Any]] = []
+    for order in orders:
+        security_id = int(order["security_id"]); quantity = Decimal(str(order.get("quantity") or 0)); price = Decimal(str(order.get("unit_price") or 0))
+        gross = Decimal(str(order.get("gross_amount") or 0)); fee = Decimal(str(order.get("fee_amount") or 0)); held, average = positions.get(security_id, (Decimal("0"), Decimal("0")))
+        if str(order.get("side", "")).lower() == "buy":
+            new_quantity = held + quantity
+            cost_basis = gross + fee
+            average = ((held * average) + cost_basis) / new_quantity if new_quantity else Decimal("0")
+            held = new_quantity; realized = Decimal("0")
+        else:
+            matched = min(held, quantity); cost_basis = average * matched
+            realized = gross - fee - cost_basis
+            held = max(Decimal("0"), held - quantity)
+            if held == 0: average = Decimal("0")
+        positions[security_id] = (held, average)
+        result.append({**order, "cost_basis": cost_basis.quantize(Decimal("0.01")), "realized_pnl": realized.quantize(Decimal("0.01")), "running_quantity": held, "average_cost": average})
+    return result
+
+
+def _profit_surveillance_settings(connection: Any) -> dict[str, Any]:
+    rows = all_rows(connection, "SELECT setting_key,setting_value FROM system_settings WHERE setting_key LIKE 'profit_surveillance_%'")
+    values = {str(row["setting_key"]): str(row["setting_value"]) for row in rows}
+    enabled = values.get("profit_surveillance_enabled", "1").lower() in {"1", "true", "yes", "on"}
+    include_unrealized = values.get("profit_surveillance_include_unrealized", "1").lower() in {"1", "true", "yes", "on"}
+    auto_restrict = values.get("profit_surveillance_auto_restrict", "1").lower() in {"1", "true", "yes", "on"}
+    return {"enabled": enabled, "gain_threshold": Decimal(values.get("profit_surveillance_gain_threshold", "1000000000")),
+        "window_hours": int(values.get("profit_surveillance_window_hours", "24")), "include_unrealized": include_unrealized, "auto_restrict": auto_restrict}
+
+
+def _evaluate_profit_surveillance(connection: Any, market_account_id: int) -> dict[str, Any]:
+    settings = _profit_surveillance_settings(connection)
+    if not settings["enabled"]: return {"flagged": False, "disabled": True}
+    cutoff = utcnow() - timedelta(hours=int(settings["window_hours"]))
+    equity_ledger = _equity_pnl_ledger(connection, market_account_id)
+    equity_realized = sum((Decimal(str(row["realized_pnl"])) for row in equity_ledger if _as_utc(row["occurred_at"]) >= cutoff), Decimal("0"))
+    margin = one(connection, """SELECT COALESCE(SUM(realized_pnl) FILTER(WHERE status<>'open' AND closed_at::timestamptz>=:cutoff),0) AS realized,
+        COALESCE(SUM(CASE WHEN status='open' AND direction='short' THEN (entry_price-s.price)*quantity WHEN status='open' THEN (s.price-entry_price)*quantity ELSE 0 END),0) AS unrealized
+        FROM market_margin_positions p JOIN market_securities s ON s.id=p.security_id WHERE p.account_id=:account""", {"account": market_account_id, "cutoff": cutoff}) or {}
+    holdings = one(connection, """SELECT COALESCE(SUM((s.price-h.average_cost)*h.quantity),0) AS unrealized FROM market_holdings h
+        JOIN market_securities s ON s.id=h.security_id WHERE h.account_id=:account""", {"account": market_account_id}) or {}
+    realized = equity_realized + Decimal(str(margin.get("realized") or 0))
+    unrealized = Decimal(str(margin.get("unrealized") or 0)) + Decimal(str(holdings.get("unrealized") or 0))
+    gain = realized + (unrealized if settings["include_unrealized"] else Decimal("0"))
+    if gain < Decimal(str(settings["gain_threshold"])): return {"flagged": False, "gain": gain}
+    account = one(connection, """SELECT a.id,r.account_id,r.display_name FROM market_accounts a JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+        WHERE a.id=:account""", {"account": market_account_id})
+    if not account: return {"flagged": False, "gain": gain}
+    evidence = {"gain": str(gain), "realized_pnl": str(realized), "unrealized_pnl": str(unrealized), "threshold": str(settings["gain_threshold"]), "window_hours": settings["window_hours"]}
+    existing_case = one(connection, """SELECT id,case_id FROM fcx_investigations WHERE account_id=:account AND status<>'closed'
+        AND summary LIKE '[AUTO PROFIT FLAG]%' ORDER BY updated_at DESC LIMIT 1""", {"account": account["account_id"]})
+    summary = f"[AUTO PROFIT FLAG] {account['display_name']} gained ${gain:,.2f} within the configured {settings['window_hours']}-hour window. Evidence: {json.dumps(evidence, separators=(',', ':'))}"
+    if existing_case:
+        execute(connection, "UPDATE fcx_investigations SET status='restricted',priority='critical',summary=:summary,updated_at=NOW() WHERE id=:id", {"summary": summary, "id": existing_case["id"]})
+        case_id = str(existing_case["case_id"])
+    else:
+        case_id = "FEC-AUTO-" + secrets.token_hex(6).upper()
+        execute(connection, """INSERT INTO fcx_investigations(case_id,account_id,status,priority,summary,notes_json,opened_by,created_at,updated_at)
+            VALUES (:case,:account,'restricted','critical',:summary,CAST(:notes AS jsonb),0,NOW(),NOW())""", {"case": case_id, "account": account["account_id"], "summary": summary, "notes": json.dumps([{"type": "profit_surveillance", **evidence}])})
+        audit(connection, actor_type="system", actor_id="fec-profit-surveillance", action="investigation.profit_flag_opened", target_type="ravenhood_account", target_id=str(account["account_id"]), new={"case_id": case_id, **evidence})
+    if settings["auto_restrict"] and not one(connection, "SELECT id FROM market_account_trading_restrictions WHERE account_id=:account AND status='active'", {"account": market_account_id}):
+        restriction = one(connection, """INSERT INTO market_account_trading_restrictions(account_id,scope,status,reason,case_reference,created_by_name,created_at)
+            VALUES (:account,'full','active',:reason,:case,'FEC automated surveillance',NOW()) RETURNING id""", {"account": market_account_id, "reason": f"Automated excessive-profit flag: ${gain:,.2f} in {settings['window_hours']} hours", "case": case_id})
+        audit(connection, actor_type="system", actor_id="fec-profit-surveillance", action="fec.account.auto_restricted", target_type="ravenhood_account", target_id=str(account["account_id"]), new={"restriction_id": restriction["id"], "scope": "full", "case_reference": case_id, **evidence})
+    return {"flagged": True, "account_id": account["account_id"], "case_id": case_id, **evidence}
+
+
 @router.get("/admin/investigations/accounts/{account_id}/history")
 def investigation_account_history(account_id: str, page: int = 1, page_size: int = 50, search: str = "", symbol: str = "", transaction_type: str = "", sort: Literal["asc", "desc"] = "desc", _: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "commissioner", "fec_investigator"))) -> dict[str, Any]:
     page = max(1, page); page_size = max(10, min(page_size, 100)); offset = (page - 1) * page_size
@@ -908,6 +997,12 @@ def investigation_account_history(account_id: str, page: int = 1, page_size: int
           AND (:symbol='' OR UPPER(ticker)=:symbol) AND (:type='' OR LOWER(transaction_type)=:type)"""
         total = one(connection, f"SELECT COUNT(*) AS count FROM ({history_sql}) counted", values) or {"count": 0}
         rows = all_rows(connection, f"{history_sql} ORDER BY occurred_at {sort.upper()},id {sort.upper()} LIMIT :limit OFFSET :offset", values)
+        equity_pnl = {int(item["id"]): item for item in _equity_pnl_ledger(connection, int(account["market_account_id"]))}
+        for row in rows:
+            if str(row.get("transaction_type", "")).startswith("equity_") and int(row["id"]) in equity_pnl:
+                calculated = equity_pnl[int(row["id"])]
+                row["realized_pnl"] = calculated["realized_pnl"]
+                row["cost_basis"] = calculated["cost_basis"]
         leverage = all_rows(connection, """SELECT p.*,s.ticker,s.name,s.price AS current_price,
             CASE WHEN p.direction='short' THEN (p.entry_price-s.price)*p.quantity ELSE (s.price-p.entry_price)*p.quantity END AS unrealized_pnl
             FROM market_margin_positions p JOIN market_securities s ON s.id=p.security_id WHERE p.account_id=:id AND p.status='open' ORDER BY p.opened_at DESC""", {"id": account["market_account_id"]})
@@ -928,8 +1023,51 @@ def investigation_account_analytics(account_id: str, period: Literal["day", "wee
             COUNT(*) FILTER(WHERE realized_pnl<0 AND status<>'open' AND closed_at::timestamptz>=NOW()-CAST(:period AS interval)) AS losing_trades,
             COALESCE(SUM(CASE WHEN status='open' AND direction='short' THEN (entry_price-s.price)*quantity WHEN status='open' THEN (s.price-entry_price)*quantity ELSE 0 END),0) AS unrealized_pnl
             FROM market_margin_positions p JOIN market_securities s ON s.id=p.security_id WHERE p.account_id=:id""", {"id": account["id"], "period": interval}) or {}
-    realized = Decimal(str(margin.get("realized_pnl") or 0)); unrealized = Decimal(str(margin.get("unrealized_pnl") or 0))
-    return {"ok": True, "period": period, "analytics": {**equity, **margin, "combined_pnl": realized+unrealized}}
+        cutoff = utcnow() - timedelta(seconds={"day": 86400, "week": 604800, "month": 2592000, "year": 31536000}[period])
+        period_equity = [row for row in _equity_pnl_ledger(connection, int(account["id"])) if _as_utc(row["occurred_at"]) >= cutoff]
+        equity_realized = sum((Decimal(str(row["realized_pnl"])) for row in period_equity), Decimal("0"))
+        equity_wins = sum(1 for row in period_equity if str(row.get("side")) == "sell" and Decimal(str(row["realized_pnl"])) > 0)
+        equity_losses = sum(1 for row in period_equity if str(row.get("side")) == "sell" and Decimal(str(row["realized_pnl"])) < 0)
+        holdings_unrealized = Decimal(str((one(connection, """SELECT COALESCE(SUM((s.price-h.average_cost)*h.quantity),0) AS pnl
+            FROM market_holdings h JOIN market_securities s ON s.id=h.security_id WHERE h.account_id=:id""", {"id": account["id"]}) or {}).get("pnl") or 0))
+    leverage_realized = Decimal(str(margin.get("realized_pnl") or 0)); leverage_unrealized = Decimal(str(margin.get("unrealized_pnl") or 0))
+    realized = equity_realized + leverage_realized; unrealized = holdings_unrealized + leverage_unrealized
+    winning_trades = equity_wins + int(margin.get("winning_trades") or 0); losing_trades = equity_losses + int(margin.get("losing_trades") or 0)
+    return {"ok": True, "period": period, "analytics": {**equity, **margin, "equity_realized_pnl": equity_realized, "leverage_realized_pnl": leverage_realized, "realized_pnl": realized, "equity_unrealized_pnl": holdings_unrealized, "unrealized_pnl": unrealized, "combined_pnl": realized+unrealized, "winning_trades": winning_trades, "losing_trades": losing_trades}}
+
+
+@router.get("/admin/investigations/profit-surveillance")
+def profit_surveillance(_: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "commissioner", "fec_investigator"))) -> dict[str, Any]:
+    with transaction() as connection:
+        settings = _profit_surveillance_settings(connection)
+        flags = all_rows(connection, """SELECT i.*,r.display_name FROM fcx_investigations i JOIN fcx_ravenhood_accounts r ON r.account_id=i.account_id
+            WHERE i.summary LIKE '[AUTO PROFIT FLAG]%' ORDER BY i.updated_at DESC LIMIT 100""")
+    return {"ok": True, "settings": settings, "flags": flags}
+
+
+@router.patch("/admin/investigations/profit-surveillance")
+def update_profit_surveillance(payload: ProfitSurveillancePatch, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    values = {"profit_surveillance_enabled": payload.enabled, "profit_surveillance_gain_threshold": payload.gain_threshold,
+        "profit_surveillance_window_hours": payload.window_hours, "profit_surveillance_include_unrealized": payload.include_unrealized,
+        "profit_surveillance_auto_restrict": payload.auto_restrict}
+    with transaction() as connection:
+        previous = _profit_surveillance_settings(connection)
+        for key, value in values.items():
+            stored = "1" if value is True else "0" if value is False else str(value)
+            execute(connection, """INSERT INTO system_settings(setting_key,setting_value,updated_at) VALUES (:key,:value,NOW())
+                ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at""", {"key": key, "value": stored})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="investigation.profit_surveillance_updated", target_type="system_settings", target_id="profit_surveillance", previous=previous, new=payload.model_dump(), request=request)
+    return {"ok": True, "settings": payload.model_dump()}
+
+
+@router.post("/admin/investigations/profit-surveillance/scan")
+def scan_profit_surveillance(request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        accounts = all_rows(connection, "SELECT id FROM market_accounts ORDER BY id")
+        results = [_evaluate_profit_surveillance(connection, int(row["id"])) for row in accounts]
+        flagged = [row for row in results if row.get("flagged")]
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="investigation.profit_surveillance_scan", target_type="market_accounts", target_id="all", new={"accounts_scanned": len(accounts), "flags": len(flagged)}, request=request)
+    return {"ok": True, "accounts_scanned": len(accounts), "flags": flagged}
 
 
 @router.get("/admin/system-health")
@@ -2908,6 +3046,7 @@ def _execute_wallet_trade(trade_request_id: str, community_id: str) -> None:
         execute(connection, """UPDATE fcx_trade_requests SET status='SETTLED',executed_order_id=:order,executed_price=:price,
             executed_gross=:gross,executed_fee=:fee,executed_at=NOW(),settled_at=NOW(),failure_code='',failure_message='',updated_at=NOW() WHERE id=:id""", {"order": order["id"], "price": price, "gross": gross, "fee": fee, "id": trade["id"]})
         audit(connection, actor_type="system", actor_id="fcx-trade", action=f"trade.{side}_settled", target_type="trade_request", target_id=trade_request_id, new={"order_id": order["id"], "gross": str(gross), "fee": str(fee), "settlement_source": "fcx_wallet"})
+        _evaluate_profit_surveillance(connection, int(account["id"]))
 
 
 def _execute_sell_and_create_credit(trade_request_id: str, community_id: str) -> str:
@@ -3319,6 +3458,7 @@ def close_margin_position(position_id: int, community_user_id: str, account_id: 
             realized_pnl=:pnl,payout_amount=:payout,settlement_status='completed',settled_at=:closed,close_reason='resident_close',closed_at=:closed WHERE id=:id""",
             {"price": metrics["mark_price"], "notional": metrics["close_notional"], "fee": metrics["close_fee"], "pnl": metrics["unrealized_pnl"], "payout": payout, "closed": closed_at, "id": position_id})
         audit(connection, actor_type="community", actor_id=community_id, action="margin.position.closed", target_type="margin_position", target_id=str(position_id), new={"payout": str(payout)}, request=request)
+        _evaluate_profit_surveillance(connection, int(account["market_account_id"]))
     return {"ok": True, "status": "closed", "position_id": position_id, "payout_amount": payout, **metrics}
 
 

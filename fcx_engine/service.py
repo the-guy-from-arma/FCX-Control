@@ -101,6 +101,7 @@ engine = create_engine(
 scheduler = BackgroundScheduler(timezone="UTC", daemon=True)
 worker_guard = threading.Lock()
 settlement_guard = threading.Lock()
+surveillance_guard = threading.Lock()
 logger = logging.getLogger(__name__)
 app = FastAPI(title="FCX Autonomous Market Engine", version="1.0.0")
 
@@ -169,6 +170,26 @@ def settlement_reconciliation_tick() -> None:
         settlement_guard.release()
 
 
+def profit_surveillance_tick() -> None:
+    """Continuously catch profit spikes caused by fills or market-price movement."""
+    if not surveillance_guard.acquire(blocking=False):
+        return
+    try:
+        from fcx_control.api import _evaluate_profit_surveillance
+        from fcx_control.db import all_rows as control_rows, transaction as control_transaction
+
+        with control_transaction() as connection:
+            accounts = control_rows(connection, "SELECT id FROM market_accounts ORDER BY id")
+            flagged = [_evaluate_profit_surveillance(connection, int(row["id"])) for row in accounts]
+        count = sum(1 for row in flagged if row.get("flagged"))
+        if count:
+            logger.warning("FEC profit surveillance has %s flagged account(s)", count)
+    except Exception:
+        logger.exception("FEC profit surveillance scan failed")
+    finally:
+        surveillance_guard.release()
+
+
 @app.on_event("startup")
 def startup() -> None:
     # Control identities and communities must exist before the exchange-owned
@@ -192,6 +213,7 @@ def startup() -> None:
             max_instances=1,
             coalesce=True,
         )
+        scheduler.add_job(profit_surveillance_tick, "interval", seconds=60, id="fec_profit_surveillance", max_instances=1, coalesce=True)
         scheduler.start()
 
 
