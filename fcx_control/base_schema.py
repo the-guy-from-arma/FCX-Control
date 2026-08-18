@@ -449,6 +449,27 @@ def ensure_base_schema(db: Any) -> None:
         "ALTER TABLE market_holdings "
         "ADD COLUMN IF NOT EXISTS reserved_quantity NUMERIC(24,8) NOT NULL DEFAULT 0"
     )
+    # Custody tables existed in early FEC builds with fewer identity, case,
+    # allocation, and officer fields. CREATE TABLE IF NOT EXISTS does not add
+    # those columns on an upgraded Railway database, so keep the ledger
+    # additive-compatible before any seizure or disposition is attempted.
+    custody_columns = (
+        "ADD COLUMN IF NOT EXISTS market_account_id INTEGER",
+        "ADD COLUMN IF NOT EXISTS target_user_id BIGINT",
+        "ADD COLUMN IF NOT EXISTS target_name TEXT NOT NULL DEFAULT ''",
+        "ADD COLUMN IF NOT EXISTS target_account_id TEXT NOT NULL DEFAULT ''",
+        "ADD COLUMN IF NOT EXISTS target_identity_id TEXT NOT NULL DEFAULT ''",
+        "ADD COLUMN IF NOT EXISTS case_reference TEXT NOT NULL DEFAULT ''",
+        "ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT ''",
+        "ADD COLUMN IF NOT EXISTS allocation_json JSONB NOT NULL DEFAULT '[]'::jsonb",
+        "ADD COLUMN IF NOT EXISTS created_by BIGINT",
+        "ADD COLUMN IF NOT EXISTS created_by_name TEXT NOT NULL DEFAULT ''",
+        "ADD COLUMN IF NOT EXISTS created_at TEXT NOT NULL DEFAULT ''",
+    )
+    for column in custody_columns:
+        db.execute(f"ALTER TABLE market_fec_asset_ledger {column}")
+    db.execute("ALTER TABLE market_fec_asset_pool ADD COLUMN IF NOT EXISTS balance NUMERIC(24,2) NOT NULL DEFAULT 0")
+    db.execute("ALTER TABLE market_fec_asset_pool ADD COLUMN IF NOT EXISTS updated_at TEXT NOT NULL DEFAULT ''")
     db.execute(
         "INSERT INTO market_fec_asset_pool (id,balance,updated_at) VALUES (1,0,'') "
         "ON CONFLICT (id) DO NOTHING"

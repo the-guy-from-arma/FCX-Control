@@ -1984,6 +1984,7 @@ def release_account_restriction(restriction_id: int, payload: ReleaseRequest, re
 def seize_fec_assets(payload: AssetSeizureRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
     now = utcnow().isoformat()
     with transaction() as connection:
+        execute(connection, "INSERT INTO market_fec_asset_pool(id,balance,updated_at) VALUES (1,0,:now) ON CONFLICT(id) DO NOTHING", {"now": now})
         locked_account = one(connection, "SELECT id FROM market_accounts WHERE id=:id FOR UPDATE", {"id": payload.account_id})
         if not locked_account:
             raise HTTPException(status_code=404, detail="Ravenhood market account not found")

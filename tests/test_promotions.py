@@ -32,6 +32,15 @@ class PromotionCompatibilityTests(unittest.TestCase):
         self.assertIn("market_promo_redemptions_promo_account_idx", sql)
         self.assertIn("ADD COLUMN IF NOT EXISTS created_by_name", sql)
 
+    def test_startup_repairs_legacy_fec_custody_schema(self):
+        connection = RecordingConnection()
+        ensure_base_schema(connection)
+        sql = "\n".join(connection.statements)
+        self.assertIn("ALTER TABLE market_fec_asset_ledger ADD COLUMN IF NOT EXISTS case_reference", sql)
+        self.assertIn("ALTER TABLE market_fec_asset_ledger ADD COLUMN IF NOT EXISTS allocation_json", sql)
+        self.assertIn("ALTER TABLE market_fec_asset_ledger ADD COLUMN IF NOT EXISTS target_identity_id", sql)
+        self.assertIn("ALTER TABLE market_fec_asset_pool ADD COLUMN IF NOT EXISTS updated_at", sql)
+
 
 if __name__ == "__main__":
     unittest.main()
