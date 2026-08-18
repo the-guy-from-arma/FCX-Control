@@ -3079,17 +3079,24 @@ def community_market(
                       f.base_nav,f.management_fee_percent,f.last_rebalanced_at,
                       f.last_valued_at,s.ticker,s.price,s.previous_price,
                       (SELECT COUNT(*) FROM market_index_members m WHERE m.fund_id=f.id) AS constituent_count,
+                      COALESCE((SELECT SUM(h.quantity) FROM market_holdings h
+                          WHERE h.security_id=f.security_id AND h.quantity>0),0) AS resident_units,
                       COALESCE((SELECT SUM(ms.price*ms.issued_shares) FROM market_index_members m
-                          JOIN market_securities ms ON ms.id=m.security_id WHERE m.fund_id=f.id),0) AS market_cap
+                          JOIN market_securities ms ON ms.id=m.security_id WHERE m.fund_id=f.id),0) AS underlying_market_cap
                FROM market_index_funds f
                JOIN market_securities s ON s.id=f.security_id
                WHERE f.enabled=1 ORDER BY f.fund_key""",
         )
         member_rows = all_rows(
             connection,
-            """SELECT m.fund_id,s.ticker,s.name,m.weight,m.rank,m.reference_price,
+            """SELECT m.fund_id,s.ticker,s.name,s.price AS current_price,m.weight,m.rank,m.reference_price,
                       m.market_cap_at_rebalance,m.realized_volatility,
-                      ROUND(s.price*s.issued_shares,2) AS market_cap
+                      ROUND(s.price*s.issued_shares,2) AS market_cap,
+                      COALESCE((SELECT SUM(p.quantity) FROM fcx_engine_npc_positions p
+                          WHERE p.security_id=s.id AND p.quantity>0),0) AS engine_shares,
+                      COALESCE((SELECT SUM(p.quantity) FROM fcx_engine_npc_positions p
+                          JOIN fcx_engine_npc_investors i ON i.id=p.investor_id
+                          WHERE p.security_id=s.id AND p.quantity>0 AND i.personality='market_maker'),0) AS market_maker_shares
                FROM market_index_members m
                JOIN market_securities s ON s.id=m.security_id
                ORDER BY m.fund_id,m.rank,s.ticker""",
@@ -3131,6 +3138,28 @@ def community_market(
             ((current_price - previous_price) / previous_price) * Decimal("100")
             if previous_price > 0 else Decimal("0")
         ).quantize(Decimal("0.01"))
+        # Engine positions are stored as underlying-company shares. Convert
+        # their live constituent value into equivalent index-fund units.
+        engine_capitalization = sum((
+            Decimal(str(item.get("engine_shares") or 0))
+            * Decimal(str(item.get("current_price") or 0)) for item in constituents
+        ), Decimal("0"))
+        market_maker_capitalization = sum((
+            Decimal(str(item.get("market_maker_shares") or 0))
+            * Decimal(str(item.get("current_price") or 0)) for item in constituents
+        ), Decimal("0"))
+        resident_units = Decimal(str(fund.get("resident_units") or 0))
+        engine_units = engine_capitalization / current_price if current_price > 0 else Decimal("0")
+        market_maker_units = market_maker_capitalization / current_price if current_price > 0 else Decimal("0")
+        total_units = resident_units + engine_units
+        fund["resident_units"] = resident_units.quantize(Decimal("0.000001"))
+        fund["engine_shares"] = engine_units.quantize(Decimal("0.000001"))
+        fund["market_maker_shares"] = market_maker_units.quantize(Decimal("0.000001"))
+        fund["total_capitalized_units"] = total_units.quantize(Decimal("0.000001"))
+        fund["resident_capitalization"] = (resident_units * current_price).quantize(Decimal("0.01"))
+        fund["engine_capitalization"] = engine_capitalization.quantize(Decimal("0.01"))
+        fund["market_maker_capitalization"] = market_maker_capitalization.quantize(Decimal("0.01"))
+        fund["market_cap"] = (total_units * current_price).quantize(Decimal("0.01"))
         fund["constituents"] = constituents
         fund["members"] = constituents
     trade_tape: list[dict[str, Any]] = []
