@@ -1519,7 +1519,7 @@ def _fifteen_minute_cycle(db: Any, config: EngineConfig, seed: int) -> dict[str,
         risk = max(0.0, min(100.0, float(row.get("risk_score") or 25) + (1.5 if float(row.get("profit") or 0) < 0 else -0.5)))
         bankruptcy = max(0.0, min(100.0, risk * 0.7 + int(row.get("consecutive_losses") or 0) * 4))
         db.execute("UPDATE fcx_engine_company_fundamentals SET fundamental_score=?,risk_score=?,bankruptcy_risk=?,analyzed_at=?,updated_at=? WHERE security_id=?", (score, risk, bankruptcy, timestamp, timestamp, row["id"]))
-        if risk >= 75:
+        if risk >= config.company_distress_threshold:
             existing = _one(db, "SELECT id FROM fcx_engine_risk_flags WHERE status='open' AND flag_type='company_distress' AND security_id=?", (row["id"],))
             evidence = json.dumps({"risk_score": risk, "bankruptcy_risk": bankruptcy, "ticker": row["ticker"]}, separators=(",", ":"))
             if existing:
@@ -1901,6 +1901,7 @@ def admin_snapshot(db: Any, settings: dict[str, Any]) -> dict[str, Any]:
         "panic_participation_percent": config.panic_participation_percent,
         "events_enabled": config.events_enabled,
         "event_probability_percent": config.event_probability_percent, "sentiment_sensitivity": config.sentiment_sensitivity,
+        "company_distress_threshold": config.company_distress_threshold,
         "halt_risk_threshold": config.halt_risk_threshold,
         "circuit_breaker_10m_percent": config.circuit_breaker_10m_percent,
         "circuit_breaker_30m_percent": config.circuit_breaker_30m_percent,

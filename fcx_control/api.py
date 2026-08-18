@@ -224,6 +224,12 @@ class ProfitSurveillancePatch(BaseModel):
     auto_restrict: bool = True
 
 
+class RiskFlagDispositionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["resolved", "dismissed"] = "resolved"
+    note: str = Field(min_length=3, max_length=2000)
+
+
 class MarketSettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     market_open: bool | None = None
@@ -497,8 +503,9 @@ def overview(_: dict[str, Any] = Depends(require_roles(*ADMIN_ROLES, "fec_invest
             JOIN market_accounts a ON a.id=p.account_id JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
             LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
             WHERE p.status='open' GROUP BY p.id,s.id,r.id ORDER BY ABS(CASE WHEN p.direction='short' THEN (p.entry_price-s.price)*p.quantity ELSE (s.price-p.entry_price)*p.quantity END) DESC LIMIT 12""")
-        recent_alerts = all_rows(connection, """SELECT 'risk' AS alert_type,flag_type AS title,severity,last_seen_at AS created_at,security_id::text AS target
-            FROM fcx_engine_risk_flags WHERE status='open' ORDER BY last_seen_at DESC LIMIT 10""")
+        recent_alerts = all_rows(connection, """SELECT f.id,'risk' AS alert_type,f.flag_type AS title,f.severity,f.last_seen_at AS created_at,
+            f.security_id::text AS target,f.evidence_json,s.ticker,s.name FROM fcx_engine_risk_flags f
+            LEFT JOIN market_securities s ON s.id=f.security_id WHERE f.status='open' ORDER BY f.last_seen_at DESC LIMIT 10""")
         active_companies = all_rows(connection, """SELECT id,ticker,name,price,previous_price,updated_at FROM market_securities
             WHERE active=1 AND lifecycle_status='active' ORDER BY ticker""")
         recent_trades = all_rows(connection, """SELECT o.created_at,o.side,o.quantity,o.unit_price,o.gross_amount,
@@ -1398,6 +1405,52 @@ def engine_dividend(payload: EngineDividendRequest, request: Request, user: dict
     with transaction() as connection:
         audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="engine.dividend.declared", target_type="security", target_id=payload.ticker.upper(), new=payload.model_dump(), request=request)
     return result
+
+
+def _risk_flag_recommendation(flag: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    evidence = flag.get("evidence_json") or {}
+    if isinstance(evidence, str):
+        try: evidence = json.loads(evidence)
+        except (TypeError, ValueError): evidence = {}
+    flag_type = str(flag.get("flag_type") or "")
+    mappings = {
+        "company_distress": ("company_distress_threshold", "risk_score", 5, 50, 99),
+        "abnormal_volume": ("abnormal_volume_float_percent", "percent_of_float", 1, .01, 100),
+        "flow_concentration": ("flow_concentration_percent", "market_share_percent", 5, 1, 100),
+        "rapid_round_trip": ("rapid_round_trip_percent", "round_trip_percent", 5, 1, 100),
+        "wash_trading_pattern": ("wash_round_trip_percent", "round_trip_percent", 3, 1, 100),
+        "coordinated_flow_review": ("coordinated_flow_imbalance_percent", "directional_imbalance_percent", 5, 1, 100),
+    }
+    mapped = mappings.get(flag_type)
+    if not mapped: return {"settings": {}, "explanation": "No automatic threshold adjustment is advised for this signal; review its evidence manually."}
+    setting, evidence_key, buffer, minimum, maximum = mapped
+    current = float(settings.get(setting) or minimum); observed = float(evidence.get(evidence_key) or current)
+    advised = min(maximum, max(current, observed + buffer))
+    if advised >= maximum and observed >= maximum:
+        advised = maximum
+    return {"settings": {setting: round(advised, 2)}, "current": {setting: current}, "observed": {evidence_key: observed},
+        "explanation": f"Raise {setting.replace('_', ' ')} from {current:g} to {advised:g}; this places a measured buffer above the observed {observed:g} without disabling surveillance."}
+
+
+@router.get("/admin/risk-flags/{flag_id}")
+def risk_flag_review(flag_id: int, _: dict[str, Any] = Depends(require_roles("developer", "fec_admin", "commissioner", "fec_investigator"))) -> dict[str, Any]:
+    with transaction() as connection:
+        flag = one(connection, """SELECT f.*,s.ticker,s.name,s.price,s.lifecycle_status FROM fcx_engine_risk_flags f
+            LEFT JOIN market_securities s ON s.id=f.security_id WHERE f.id=:id""", {"id": flag_id})
+    if not flag: raise HTTPException(status_code=404, detail="Risk alert not found")
+    try: settings = engine_market_snapshot().get("engine", {}).get("settings", {})
+    except Exception: settings = {}
+    return {"ok": True, "flag": flag, "recommendation": _risk_flag_recommendation(flag, settings), "settings": settings}
+
+
+@router.post("/admin/risk-flags/{flag_id}/disposition")
+def dispose_risk_flag(flag_id: int, payload: RiskFlagDispositionRequest, request: Request, user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin"))) -> dict[str, Any]:
+    with transaction() as connection:
+        existing = one(connection, "SELECT * FROM fcx_engine_risk_flags WHERE id=:id", {"id": flag_id})
+        if not existing: raise HTTPException(status_code=404, detail="Risk alert not found")
+        execute(connection, "UPDATE fcx_engine_risk_flags SET status=:status,last_seen_at=NOW() WHERE id=:id", {"status": payload.status, "id": flag_id})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]), action="engine.risk_flag.reviewed", target_type="risk_flag", target_id=str(flag_id), previous=existing, new=payload.model_dump(), reason=payload.note, request=request)
+    return {"ok": True, "status": payload.status}
 
 
 def _eligible_index_securities(connection: Any) -> list[dict[str, Any]]:

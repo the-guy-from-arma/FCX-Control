@@ -119,6 +119,7 @@ class EngineConfig:
     panic_participation_percent: float
     event_probability_percent: float
     sentiment_sensitivity: float
+    company_distress_threshold: float
     halt_risk_threshold: float
     circuit_breaker_10m_percent: float
     circuit_breaker_30m_percent: float
@@ -180,6 +181,7 @@ class EngineConfig:
             panic_participation_percent=_number(settings.get("fcx_engine_panic_participation_percent"), 20, 0, 100),
             event_probability_percent=_number(settings.get("fcx_engine_event_probability_percent"), 30, 0, 100),
             sentiment_sensitivity=_number(settings.get("fcx_engine_sentiment_sensitivity"), 1, 0, 5),
+            company_distress_threshold=_number(settings.get("fcx_engine_company_distress_threshold"), 75, 50, 100),
             halt_risk_threshold=_number(settings.get("fcx_engine_halt_risk_threshold"), 95, 50, 100),
             circuit_breaker_10m_percent=_number(settings.get("fcx_engine_circuit_breaker_10m_percent"), 20, 0.1, 500),
             circuit_breaker_30m_percent=_number(settings.get("fcx_engine_circuit_breaker_30m_percent"), 35, 0.1, 1000),

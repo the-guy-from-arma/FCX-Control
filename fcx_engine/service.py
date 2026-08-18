@@ -481,6 +481,7 @@ class EngineSettingsRequest(BaseModel):
     panic_participation_percent: float | None = Field(default=None, ge=0, le=100)
     event_probability_percent: float | None = Field(default=None, ge=0, le=100)
     sentiment_sensitivity: float | None = Field(default=None, ge=0, le=5)
+    company_distress_threshold: float | None = Field(default=None, ge=50, le=100)
     halt_risk_threshold: float | None = Field(default=None, ge=50, le=100)
     circuit_breaker_10m_percent: float | None = Field(default=None, ge=.1, le=500)
     circuit_breaker_30m_percent: float | None = Field(default=None, ge=.1, le=1000)
@@ -536,6 +537,7 @@ def admin_settings(payload: EngineSettingsRequest) -> dict[str, Any]:
         "panic_participation_percent": "fcx_engine_panic_participation_percent",
         "event_probability_percent": "fcx_engine_event_probability_percent",
         "sentiment_sensitivity": "fcx_engine_sentiment_sensitivity",
+        "company_distress_threshold": "fcx_engine_company_distress_threshold",
         "halt_risk_threshold": "fcx_engine_halt_risk_threshold",
         "circuit_breaker_10m_percent": "fcx_engine_circuit_breaker_10m_percent",
         "circuit_breaker_30m_percent": "fcx_engine_circuit_breaker_30m_percent",
