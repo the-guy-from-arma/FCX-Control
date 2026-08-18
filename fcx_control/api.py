@@ -2807,6 +2807,54 @@ def _execute_buy_after_debit(trade_request_id: str, community_id: str) -> None:
         audit(connection, actor_type="system", actor_id="fcx-trade", action="trade.buy_settled", target_type="trade_request", target_id=trade_request_id, new={"order_id": order["id"], "gross": str(gross), "fee": str(fee)})
 
 
+def _execute_wallet_trade(trade_request_id: str, community_id: str) -> None:
+    """Atomically settle a resident stock order against FCX buying power."""
+    with transaction() as connection:
+        trade = one(connection, "SELECT * FROM fcx_trade_requests WHERE trade_request_id=:request AND community_id=:community FOR UPDATE", {"request": trade_request_id, "community": community_id})
+        if not trade or trade.get("executed_order_id") or str(trade.get("status")) == "SETTLED":
+            return
+        account = one(connection, "SELECT * FROM market_accounts WHERE id=:id FOR UPDATE", {"id": trade["market_account_id"]})
+        security = one(connection, "SELECT * FROM market_securities WHERE id=:id FOR UPDATE", {"id": trade["security_id"]})
+        if not account or not security or not int(security.get("active") or 0) or str(security.get("lifecycle_status") or "") != "active":
+            execute(connection, "UPDATE fcx_trade_requests SET status='FAILED',failure_code='SECURITY_UNAVAILABLE',failure_message='Security is unavailable at execution',updated_at=NOW() WHERE id=:id", {"id": trade["id"]})
+            return
+        if one(connection, "SELECT id FROM market_security_halts WHERE security_id=:id AND status='active'", {"id": security["id"]}) or one(connection, "SELECT id FROM market_security_delistings WHERE security_id=:id AND status='active'", {"id": security["id"]}):
+            execute(connection, "UPDATE fcx_trade_requests SET status='QUEUED',failure_code='SECURITY_HALTED',failure_message='Waiting for security trading to resume',updated_at=NOW() WHERE id=:id", {"id": trade["id"]})
+            return
+        quantity = _quantity(trade["quantity"])
+        price = Decimal(str(security["price"]))
+        gross = _money(price * quantity)
+        fee_percent = max(Decimal("0"), _setting_decimal(connection, "market_commission_percent", "4"))
+        fee = _money(gross * fee_percent / Decimal("100"))
+        side = str(trade["side"])
+        holding = one(connection, "SELECT * FROM market_holdings WHERE account_id=:account AND security_id=:security FOR UPDATE", {"account": account["id"], "security": security["id"]})
+        if side == "buy":
+            total = gross + fee
+            if Decimal(str(account.get("cash_balance") or 0)) < total:
+                execute(connection, "UPDATE fcx_trade_requests SET status='FAILED',failure_code='INSUFFICIENT_BUYING_POWER',failure_message='Insufficient buying power at execution',updated_at=NOW() WHERE id=:id", {"id": trade["id"]})
+                return
+            execute(connection, "UPDATE market_accounts SET cash_balance=cash_balance-:total,updated_at=NOW() WHERE id=:id", {"total": total, "id": account["id"]})
+            if holding:
+                old_quantity = _quantity(holding["quantity"])
+                new_quantity = old_quantity + quantity
+                average_cost = (((old_quantity * Decimal(str(holding["average_cost"]))) + (quantity * price)) / new_quantity).quantize(Decimal("0.0001"))
+                execute(connection, "UPDATE market_holdings SET quantity=:quantity,average_cost=:cost WHERE id=:id", {"quantity": new_quantity, "cost": average_cost, "id": holding["id"]})
+            else:
+                execute(connection, "INSERT INTO market_holdings(account_id,security_id,quantity,reserved_quantity,average_cost) VALUES (:account,:security,:quantity,0,:cost)", {"account": account["id"], "security": security["id"], "quantity": quantity, "cost": price})
+        else:
+            if not holding or _quantity(holding.get("reserved_quantity")) < quantity:
+                execute(connection, "UPDATE fcx_trade_requests SET status='FAILED',failure_code='INSUFFICIENT_SHARES',failure_message='Reserved shares are unavailable at execution',updated_at=NOW() WHERE id=:id", {"id": trade["id"]})
+                return
+            proceeds = max(Decimal("0.01"), gross - fee)
+            execute(connection, "UPDATE market_holdings SET quantity=GREATEST(0,quantity-:quantity),reserved_quantity=GREATEST(0,reserved_quantity-:quantity) WHERE id=:id", {"quantity": quantity, "id": holding["id"]})
+            execute(connection, "UPDATE market_accounts SET cash_balance=cash_balance+:proceeds,updated_at=NOW() WHERE id=:id", {"proceeds": proceeds, "id": account["id"]})
+        order = one(connection, """INSERT INTO market_orders(account_id,security_id,side,quantity,unit_price,gross_amount,fee_amount,created_at)
+            VALUES (:account,:security,:side,:quantity,:price,:gross,:fee,:now) RETURNING id""", {"account": account["id"], "security": security["id"], "side": side, "quantity": quantity, "price": price, "gross": gross, "fee": fee, "now": utcnow().isoformat()})
+        execute(connection, """UPDATE fcx_trade_requests SET status='SETTLED',executed_order_id=:order,executed_price=:price,
+            executed_gross=:gross,executed_fee=:fee,executed_at=NOW(),settled_at=NOW(),failure_code='',failure_message='',updated_at=NOW() WHERE id=:id""", {"order": order["id"], "price": price, "gross": gross, "fee": fee, "id": trade["id"]})
+        audit(connection, actor_type="system", actor_id="fcx-trade", action=f"trade.{side}_settled", target_type="trade_request", target_id=trade_request_id, new={"order_id": order["id"], "gross": str(gross), "fee": str(fee), "settlement_source": "fcx_wallet"})
+
+
 def _execute_sell_and_create_credit(trade_request_id: str, community_id: str) -> str:
     with transaction() as connection:
         trade = one(
@@ -3117,7 +3165,6 @@ def create_trade_order(
 ) -> dict[str, Any]:
     community_id = str(principal["community_id"])
     ticker = payload.ticker.upper()
-    settlement_id = ""
     with transaction() as connection:
         existing = one(
             connection,
@@ -3174,27 +3221,11 @@ def create_trade_order(
                 :side,:quantity,:price,:gross,:fee,:total,:status,:now,:now)""",
             {"request": trade_request_id, "key": payload.idempotency_key, "community": community_id, "user": payload.community_user_id, "ravenhood": payload.account_id, "market_account": account["market_account_id"], "security": security["id"], "side": payload.side, "quantity": quantity, "price": price, "gross": gross, "fee": fee, "total": total, "status": "CREATED" if market_open else "QUEUED", "now": utcnow()},
         )
-        trade = _trade_response(connection, trade_request_id, community_id)
-        if payload.side == "buy" and market_open:
-            settlement_id = _create_trade_settlement(connection, trade=trade, operation="debit", amount=total)
-            execute(connection, "UPDATE fcx_trade_requests SET status='BANK_PENDING',debit_settlement_id=:settlement,updated_at=NOW() WHERE trade_request_id=:request", {"settlement": settlement_id, "request": trade_request_id})
         audit(connection, actor_type="community", actor_id=community_id, action="trade.requested", target_type="trade_request", target_id=trade_request_id, new=payload.model_dump())
     if not market_open:
         with transaction() as connection:
             return {"ok": True, "idempotent_replay": False, "trade": _trade_response(connection, trade_request_id, community_id)}
-    if payload.side == "sell":
-        settlement_id = _execute_sell_and_create_credit(trade_request_id, community_id)
-    if not settlement_id:
-        raise HTTPException(status_code=500, detail="Trade settlement was not created")
-    try:
-        settlement = _send_trade_settlement(community_id, settlement_id)
-        if payload.side == "buy" and str(settlement["state"]) == "BANK_DEBITED":
-            _execute_buy_after_debit(trade_request_id, community_id)
-        if payload.side == "sell" and str(settlement["state"]) == "BANK_CREDITED":
-            _finalize_sell_credit(trade_request_id, community_id)
-    except HTTPException:
-        with transaction() as connection:
-            execute(connection, "UPDATE fcx_trade_requests SET status='BANK_RETRY_REQUIRED',updated_at=NOW() WHERE trade_request_id=:request AND status<>'SETTLED'", {"request": trade_request_id})
+    _execute_wallet_trade(trade_request_id, community_id)
     with transaction() as connection:
         result = _trade_response(connection, trade_request_id, community_id)
     return {"ok": True, "idempotent_replay": False, "trade": result}
@@ -3218,27 +3249,11 @@ def refresh_trade_order(
     community_id = str(principal["community_id"])
     with transaction() as connection:
         trade = _trade_response(connection, trade_request_id, community_id)
-    if str(trade["status"]) == "QUEUED":
+    if str(trade["status"]) in {"QUEUED", "BANK_PENDING", "BANK_RETRY_REQUIRED", "PAYOUT_PENDING"}:
         with transaction() as connection:
             if not _setting_enabled(connection, "market_open", True):
                 return {"ok": True, "trade": _trade_response(connection, trade_request_id, community_id)}
-            if str(trade["side"]) == "buy":
-                settlement_id = _create_trade_settlement(connection, trade=trade, operation="debit", amount=_money(trade["estimated_total"]))
-                execute(connection, "UPDATE fcx_trade_requests SET status='BANK_PENDING',debit_settlement_id=:settlement,updated_at=NOW() WHERE trade_request_id=:request", {"settlement": settlement_id, "request": trade_request_id})
-            else:
-                settlement_id = ""
-        if str(trade["side"]) == "sell":
-            settlement_id = _execute_sell_and_create_credit(trade_request_id, community_id)
-        trade = {**trade, "status": "BANK_PENDING" if str(trade["side"]) == "buy" else "PAYOUT_PENDING", "debit_settlement_id": settlement_id if str(trade["side"]) == "buy" else trade.get("debit_settlement_id"), "credit_settlement_id": settlement_id if str(trade["side"]) == "sell" else trade.get("credit_settlement_id")}
-    if str(trade["status"]) != "SETTLED":
-        settlement_id = str(trade.get("debit_settlement_id") or trade.get("credit_settlement_id") or "")
-        if not settlement_id:
-            raise HTTPException(status_code=409, detail="Trade has no bank settlement")
-        settlement = _send_trade_settlement(community_id, settlement_id)
-        if str(trade["side"]) == "buy" and str(settlement["state"]) == "BANK_DEBITED":
-            _execute_buy_after_debit(trade_request_id, community_id)
-        elif str(trade["side"]) == "sell" and str(settlement["state"]) == "BANK_CREDITED":
-            _finalize_sell_credit(trade_request_id, community_id)
+        _execute_wallet_trade(trade_request_id, community_id)
     with transaction() as connection:
         result = _trade_response(connection, trade_request_id, community_id)
     return {"ok": True, "trade": result}
