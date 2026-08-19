@@ -7,7 +7,7 @@ import secrets
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -326,6 +326,11 @@ class AssetDispositionRequest(BaseModel):
     case_reference: str = Field(min_length=3, max_length=200)
     reason: str = Field(min_length=10, max_length=4000)
     authorization: str = Field(pattern=r"^FORECLOSE$")
+
+    @field_validator("authorization", mode="before")
+    @classmethod
+    def normalize_authorization(cls, value: Any) -> str:
+        return str(value or "").strip().upper()
 
 
 class IpoReviewRequest(BaseModel):
@@ -2088,14 +2093,14 @@ def dispose_fec_assets(payload: AssetDispositionRequest, request: Request, user:
             remaining = payload.amount
             for index, security in enumerate(securities):
                 cap = Decimal(str(security["market_cap"] or 0))
-                allocation = remaining if index == len(securities) - 1 else (payload.amount * cap / total_cap).quantize(Decimal("0.01"))
+                allocation = remaining if index == len(securities) - 1 else (payload.amount * cap / total_cap).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                 remaining -= allocation
                 old_price = Decimal(str(security["price"]))
                 shares = Decimal(str(security["issued_shares"]))
                 new_price = ((cap + allocation) / shares).quantize(Decimal("0.0001"))
                 volume = (allocation / old_price).quantize(Decimal("0.00000001"))
                 change = ((new_price / old_price - 1) * 100).quantize(Decimal("0.0001"))
-                execute(connection, "UPDATE market_securities SET price=:price,updated_at=:now WHERE id=:id", {"price": new_price, "now": now, "id": security["id"]})
+                execute(connection, "UPDATE market_securities SET previous_price=price,price=:price,updated_at=:now WHERE id=:id", {"price": new_price, "now": now, "id": security["id"]})
                 execute(connection, "INSERT INTO market_price_history (security_id,price,source,recorded_at) VALUES (:id,:price,'fec_reinvestment',:now)", {"id": security["id"], "price": new_price, "now": now})
                 execute(connection, """INSERT INTO market_system_trades
                     (security_id,buy_volume,sell_volume,buy_trade_count,sell_trade_count,reference_price,price_change_percent,source,rationale,created_at)

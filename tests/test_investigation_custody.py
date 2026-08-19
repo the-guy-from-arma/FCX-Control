@@ -21,7 +21,12 @@ class InvestigationCustodyUiTests(unittest.TestCase):
             self.assertIn(phrase, ui)
         self.assertIn('payload.disposition == "reinvest"', api)
         self.assertIn("payload.amount * cap / total_cap", api)
+        self.assertIn('rounding=ROUND_DOWN', api)
+        self.assertIn('previous_price=price,price=:price', api)
+        self.assertIn('def normalize_authorization', api)
         self.assertIn('action=f"fec.assets.{payload.disposition}"', api)
+        self.assertIn('const apiError =', ui)
+        self.assertNotIn('new Error(payload.detail ||', ui)
 
 
 if __name__ == "__main__":
