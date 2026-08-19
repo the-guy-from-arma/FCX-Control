@@ -201,6 +201,11 @@ class PositionPriceInterventionRequest(BaseModel):
     reason: str = Field(min_length=10, max_length=1000)
 
 
+class PositionLiquidationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(default="FEC operator liquidation", min_length=10, max_length=1000)
+
+
 class InvestigationRequest(BaseModel):
     account_id: str = Field(min_length=4, max_length=200)
     summary: str = Field(min_length=10, max_length=4000)
@@ -730,6 +735,45 @@ def intervene_position_price(
     return {"ok": True, "position_id": position_id, "ticker": position["ticker"],
             "previous_price": current_price, "target_price": target_price, "change_percent": change_percent,
             "affects_all_accounts": True}
+
+
+@router.post("/admin/live-positions/{position_id}/liquidate")
+def liquidate_live_position(
+    position_id: int,
+    payload: PositionLiquidationRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(require_admin_csrf("developer", "fec_admin")),
+) -> dict[str, Any]:
+    with transaction() as connection:
+        position = one(connection, """SELECT p.*,s.ticker,s.price AS mark_price,r.account_id AS ravenhood_account_id
+            FROM market_margin_positions p JOIN market_securities s ON s.id=p.security_id
+            JOIN market_accounts a ON a.id=p.account_id JOIN fcx_ravenhood_accounts r ON r.id=a.user_id
+            WHERE p.id=:id FOR UPDATE OF p,s,a""", {"id": position_id})
+        if not position:
+            raise HTTPException(status_code=404, detail="Leveraged position not found")
+        if str(position.get("status")) != "open":
+            raise HTTPException(status_code=409, detail="Leveraged position is no longer open")
+        fee_percent = _setting_decimal(connection, "market_trade_fee_percent", "0")
+        maintenance = _setting_decimal(connection, "market_margin_maintenance_percent", "20") / Decimal("100")
+        metrics = ravenhood_margin_metrics(position["direction"], position["entry_price"], position["mark_price"],
+            position["quantity"], position["collateral"], position["leverage"], fee_percent, maintenance)
+        payout = _money(metrics["estimated_payout"])
+        closed_at = utcnow().isoformat()
+        execute(connection, "UPDATE market_accounts SET cash_balance=cash_balance+:payout,updated_at=NOW() WHERE id=:id",
+            {"payout": payout, "id": position["account_id"]})
+        execute(connection, """UPDATE market_margin_positions SET status='closed',close_price=:price,close_notional=:notional,
+            close_fee=:fee,realized_pnl=:pnl,payout_amount=:payout,settlement_status='completed',settled_at=:closed,
+            close_reason='fec_liquidation',closed_at=:closed WHERE id=:id""",
+            {"price": metrics["mark_price"], "notional": metrics["close_notional"], "fee": metrics["close_fee"],
+             "pnl": metrics["unrealized_pnl"], "payout": payout, "closed": closed_at, "id": position_id})
+        audit(connection, actor_type="admin", actor_id=str(user["id"]), actor_role=",".join(user["roles"]),
+            action="fec.margin_position.liquidated", target_type="margin_position", target_id=str(position_id),
+            previous={"status": "open", "ticker": position["ticker"], "account_id": position["ravenhood_account_id"]},
+            new={"status": "closed", "payout": str(payout), "close_price": str(metrics["mark_price"])},
+            reason=payload.reason, request=request)
+        _evaluate_profit_surveillance(connection, int(position["account_id"]))
+    return {"ok": True, "status": "closed", "position_id": position_id, "ticker": position["ticker"],
+            "payout_amount": payout, **metrics}
 
 
 @router.get("/admin/accounts/{account_id}/profile")
