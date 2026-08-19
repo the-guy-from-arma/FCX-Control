@@ -13,6 +13,16 @@ class OpenPositionFeedTests(unittest.TestCase):
             self.assertIn(phrase, ui)
         self.assertIn('row.position_type==="leverage"', ui)
 
+    def test_resident_profiles_combine_holdings_and_leverage(self):
+        root = Path(__file__).resolve().parents[1]
+        api = (root / "fcx_control" / "api.py").read_text(encoding="utf-8")
+        ui = (root / "static" / "control.js").read_text(encoding="utf-8")
+        self.assertIn('"active_holdings": holdings', api)
+        self.assertIn('"active_leverage": [*holdings, *leverage]', api)
+        self.assertIn("function residentOpenPositions", ui)
+        self.assertIn("data.holdings||data.active_holdings", ui)
+        self.assertIn("OPEN POSITIONS — STOCKS & LEVERAGE", ui)
+
     def test_fec_can_liquidate_only_leveraged_rows(self):
         root = Path(__file__).resolve().parents[1]
         api = (root / "fcx_control" / "api.py").read_text(encoding="utf-8")

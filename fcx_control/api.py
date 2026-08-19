@@ -790,10 +790,15 @@ def account_profile(account_id: str, _: dict[str, Any] = Depends(require_roles(*
             LEFT JOIN market_accounts a ON a.user_id=r.id LEFT JOIN fcx_ravenhood_links l ON l.account_id=r.account_id AND l.active=TRUE
             WHERE r.account_id=:account GROUP BY r.id,a.id""", {"account": account_id})
         if not account: raise HTTPException(status_code=404, detail="Ravenhood account not found")
-        holdings = all_rows(connection, """SELECT h.*,s.ticker,s.name,s.price,h.quantity*s.price AS current_value,
-            (s.price-h.average_cost)*h.quantity AS unrealized_pnl FROM market_holdings h JOIN market_securities s ON s.id=h.security_id
-            WHERE h.account_id=:id AND h.quantity<>0 ORDER BY current_value DESC""", {"id": account["market_account_id"]}) if account.get("market_account_id") else []
-        leverage = all_rows(connection, """SELECT p.*,s.ticker,s.name,s.price AS current_price,
+        holdings = all_rows(connection, """SELECT ('holding-'||h.id)::text AS id,'equity' AS position_type,'long' AS side,
+            h.account_id,h.security_id,h.quantity,h.average_cost,h.average_cost AS entry_price,1::numeric AS leverage,
+            NULL::numeric AS liquidation_price,s.ticker,s.name,s.price AS current_price,h.quantity*s.price AS current_value,
+            (s.price-h.average_cost)*h.quantity AS unrealized_pnl,
+            (SELECT MIN(o.created_at)::timestamptz FROM market_orders o WHERE o.account_id=h.account_id AND o.security_id=h.security_id AND o.side='buy') AS opened_at
+            FROM market_holdings h JOIN market_securities s ON s.id=h.security_id
+            WHERE h.account_id=:id AND h.quantity>0 ORDER BY current_value DESC""", {"id": account["market_account_id"]}) if account.get("market_account_id") else []
+        leverage = all_rows(connection, """SELECT p.*,'leverage' AS position_type,p.direction AS side,s.ticker,s.name,s.price AS current_price,
+            p.quantity*s.price AS current_value,
             CASE WHEN p.direction='short' THEN (p.entry_price-s.price)*p.quantity ELSE (s.price-p.entry_price)*p.quantity END AS unrealized_pnl
             FROM market_margin_positions p JOIN market_securities s ON s.id=p.security_id WHERE p.account_id=:id AND p.status='open' ORDER BY p.opened_at DESC""", {"id": account["market_account_id"]}) if account.get("market_account_id") else []
         stats = one(connection, """SELECT COUNT(*) FILTER(WHERE side='buy') AS total_buys,COUNT(*) FILTER(WHERE side='sell') AS total_sells,
@@ -1077,10 +1082,20 @@ def investigation_account_history(account_id: str, page: int = 1, page_size: int
                 calculated = equity_pnl[int(row["id"])]
                 row["realized_pnl"] = calculated["realized_pnl"]
                 row["cost_basis"] = calculated["cost_basis"]
-        leverage = all_rows(connection, """SELECT p.*,s.ticker,s.name,s.price AS current_price,
+        holdings = all_rows(connection, """SELECT ('holding-'||h.id)::text AS id,'equity' AS position_type,'long' AS side,
+            h.account_id,h.security_id,h.quantity,h.average_cost,h.average_cost AS entry_price,1::numeric AS leverage,
+            NULL::numeric AS liquidation_price,s.ticker,s.name,s.price AS current_price,h.quantity*s.price AS current_value,
+            (s.price-h.average_cost)*h.quantity AS unrealized_pnl,
+            (SELECT MIN(o.created_at)::timestamptz FROM market_orders o WHERE o.account_id=h.account_id AND o.security_id=h.security_id AND o.side='buy') AS opened_at
+            FROM market_holdings h JOIN market_securities s ON s.id=h.security_id
+            WHERE h.account_id=:id AND h.quantity>0 ORDER BY current_value DESC""", {"id": account["market_account_id"]})
+        leverage = all_rows(connection, """SELECT p.*,'leverage' AS position_type,p.direction AS side,s.ticker,s.name,s.price AS current_price,
+            p.quantity*s.price AS current_value,
             CASE WHEN p.direction='short' THEN (p.entry_price-s.price)*p.quantity ELSE (s.price-p.entry_price)*p.quantity END AS unrealized_pnl
             FROM market_margin_positions p JOIN market_securities s ON s.id=p.security_id WHERE p.account_id=:id AND p.status='open' ORDER BY p.opened_at DESC""", {"id": account["market_account_id"]})
-    return {"ok": True, "account": account, "active_leverage": leverage, "history": rows, "pagination": {"page": page, "page_size": page_size, "total": int(total["count"] or 0), "pages": max(1, (int(total["count"] or 0)+page_size-1)//page_size)}}
+    return {"ok": True, "account": account, "active_holdings": holdings,
+            "active_leverage": [*holdings, *leverage], "leverage_positions": leverage,
+            "history": rows, "pagination": {"page": page, "page_size": page_size, "total": int(total["count"] or 0), "pages": max(1, (int(total["count"] or 0)+page_size-1)//page_size)}}
 
 
 @router.get("/admin/investigations/accounts/{account_id}/analytics")
