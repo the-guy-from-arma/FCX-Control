@@ -14,8 +14,8 @@ class SecurityDirectoryTests(unittest.TestCase):
         for phrase in ("Active, halted, and delisted securities", "security-directory-search", "security-directory-status", "data-security-directory-row", "No securities match this filter"):
             self.assertIn(phrase, ui)
         self.assertIn('tradable = securities.filter(row => row.exchange_status === "active")', ui)
-        self.assertIn("resident-open-positions-v10", index)
-        self.assertIn("fcx-control-v10-resident-open-positions", worker)
+        self.assertIn("active-restrictions-v12", index)
+        self.assertIn("fcx-control-v12-active-restrictions", worker)
         self.assertIn("self.skipWaiting()", worker)
 
 

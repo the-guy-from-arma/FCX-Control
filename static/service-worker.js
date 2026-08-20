@@ -1,5 +1,5 @@
-const CACHE = "fcx-control-v10-resident-open-positions";
-const CORE = ["/", "/control.css", "/control.js?v=resident-open-positions-v10", "/manifest.webmanifest"];
+const CACHE = "fcx-control-v12-active-restrictions";
+const CORE = ["/", "/control.css", "/control.js?v=active-restrictions-v12", "/manifest.webmanifest"];
 self.addEventListener("install", event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(CORE)).then(() => self.skipWaiting())));
 self.addEventListener("activate", event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim())));
 self.addEventListener("fetch", event => {
